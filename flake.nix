@@ -62,11 +62,11 @@
           inherit cargoArtifacts;
         });
 
+        # Only bundle ABI-stable libs. DO NOT bundle vulkan-loader or libGL
+        # — those must come from the system to match the actual GPU driver.
         runtimeLibPath = pkgs.lib.makeLibraryPath (with pkgs; [
-          vulkan-loader
           libxkbcommon
           wayland
-          libGL
           xorg.libX11
           xorg.libXcursor
           xorg.libXrandr
