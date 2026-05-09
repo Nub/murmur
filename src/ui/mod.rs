@@ -1735,6 +1735,11 @@ impl MurmurApp {
             } => {
                 self.state.add_channel_to_server(&server_id, channel);
             }
+            NetEvent::PeerSpeaking { peer_id, is_speaking } => {
+                if let Some(vp) = self.state.voice_peers.get_mut(&peer_id) {
+                    vp.speaking = is_speaking;
+                }
+            }
             NetEvent::Connected => {
                 self.connected = true;
                 for server in &self.state.servers {

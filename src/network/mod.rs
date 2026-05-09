@@ -206,6 +206,9 @@ impl NetworkManager {
 
         // Periodic maintenance interval
         let mut maintenance_interval = tokio::time::interval(Duration::from_secs(60));
+        // Fast tick for voice speaking state
+        let mut voice_tick = tokio::time::interval(Duration::from_millis(200));
+        let mut was_speaking = false;
 
         loop {
             tokio::select! {
@@ -217,6 +220,24 @@ impl NetworkManager {
                 }
                 _ = maintenance_interval.tick() => {
                     self.periodic_maintenance().await;
+                }
+                _ = voice_tick.tick() => {
+                    // Broadcast speaking state changes to peers
+                    if let Some(ref engine) = self.voice_engine {
+                        let is_speaking = engine.vad_probability() > 0.5;
+                        if is_speaking != was_speaking {
+                            was_speaking = is_speaking;
+                            let peers: Vec<PeerId> = self.known_peers.iter().cloned().collect();
+                            for peer_id in &peers {
+                                let signal = VoiceSignal {
+                                    signal_type: VoiceSignalType::Speaking { is_speaking },
+                                    from_peer_id: self.local_peer_id.to_string(),
+                                    channel_topic: String::new(),
+                                };
+                                self.swarm.behaviour_mut().voice.send_request(peer_id, signal);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -460,6 +481,12 @@ impl NetworkManager {
                                     info!("Peer {} left voice", peer);
                                     let _ = engine.disconnect_peer(&peer.to_string()).await;
                                     self.audio_sync.remove_peer(&peer.to_string());
+                                }
+                                VoiceSignalType::Speaking { is_speaking } => {
+                                    let _ = self.event_tx.send(NetEvent::PeerSpeaking {
+                                        peer_id: peer.to_string(),
+                                        is_speaking,
+                                    });
                                 }
                                 VoiceSignalType::ClockProbe { seq, t1_us } => {
                                     // Respond to clock sync probe

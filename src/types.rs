@@ -132,6 +132,8 @@ pub enum VoiceSignalType {
     ScreenShareStart,
     /// Screen share stop
     ScreenShareStop,
+    /// Speaking state update (VAD-driven)
+    Speaking { is_speaking: bool },
     /// Clock sync probe (NTP-style)
     ClockProbe { seq: u64, t1_us: u64 },
     /// Clock sync response
@@ -187,6 +189,7 @@ pub enum NetEvent {
         server_id: String,
         channel: Channel,
     },
+    PeerSpeaking { peer_id: String, is_speaking: bool },
     Connected,
     ListeningOn(String), // multiaddr string
     Error(String),
