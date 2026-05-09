@@ -26,8 +26,21 @@ const DEFAULT_BOOTSTRAP: &[&str] = &[
 ];
 
 fn main() {
+    // On Windows, check for WebView2 runtime before launching
+    #[cfg(target_os = "windows")]
+    {
+        // Try to find WebView2 - if Edge is installed it should be available
+        let webview2_key = "SOFTWARE\\Microsoft\\EdgeUpdate\\Clients\\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}";
+        let has_webview2 = winreg_check(webview2_key) || std::env::var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER").is_ok();
+        if !has_webview2 {
+            // Try to auto-download and install WebView2 bootstrapper
+            let _ = std::process::Command::new("powershell")
+                .args(["-Command", "Start-Process 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' -Wait"])
+                .status();
+        }
+    }
+
     if let Err(e) = run() {
-        // Write error to a crash log the user can find
         let crash_path = dirs::data_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("."))
             .join("murmur")
@@ -35,7 +48,32 @@ fn main() {
         let msg = format!("murmur crashed: {:#}", e);
         let _ = std::fs::write(&crash_path, &msg);
         eprintln!("{}", msg);
+
+        // On Windows, show a message box for visibility
+        #[cfg(target_os = "windows")]
+        {
+            let _ = std::process::Command::new("powershell")
+                .args(["-Command", &format!(
+                    "Add-Type -AssemblyName PresentationFramework; [System.Windows.MessageBox]::Show('{}', 'murmur - Error')",
+                    msg.replace('\'', "''")
+                )])
+                .status();
+        }
     }
+}
+
+#[cfg(target_os = "windows")]
+fn winreg_check(key: &str) -> bool {
+    std::process::Command::new("reg")
+        .args(["query", &format!("HKLM\\{}", key)])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+        || std::process::Command::new("reg")
+            .args(["query", &format!("HKCU\\{}", key)])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
 }
 
 fn run() -> Result<()> {
