@@ -47,12 +47,20 @@
             openssl
             alsa-lib       # ALSA for cpal audio
             libopus        # Opus codec
-            libxkbcommon   # screen capture deps
-            xorg.libxcb    # screen capture
-            xorg.libXrandr # screen capture
+            # Dioxus desktop (webview)
+            webkitgtk_4_1
+            gtk3
+            glib
+            gdk-pixbuf
+            cairo
+            pango
+            atk
+            libsoup_3
+            xdotool       # libxdo for Dioxus clipboard
           ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
             pkgs.darwin.apple_sdk.frameworks.Security
             pkgs.darwin.apple_sdk.frameworks.SystemConfiguration
+            pkgs.darwin.apple_sdk.frameworks.WebKit
           ];
         };
 
@@ -65,14 +73,14 @@
         # Only bundle ABI-stable libs. DO NOT bundle vulkan-loader or libGL
         # — those must come from the system to match the actual GPU driver.
         runtimeLibPath = pkgs.lib.makeLibraryPath (with pkgs; [
-          libxkbcommon
-          wayland
-          libglvnd        # provides libEGL/libGL for wgpu GL backend
-          xorg.libX11
-          xorg.libXcursor
-          xorg.libXrandr
-          xorg.libXi
-          xorg.libxcb
+          webkitgtk_4_1
+          gtk3
+          glib
+          gdk-pixbuf
+          cairo
+          pango
+          atk
+          libsoup_3
           alsa-lib
         ]);
 
@@ -82,8 +90,7 @@
           buildInputs = [ pkgs.makeWrapper ];
           postBuild = ''
             wrapProgram $out/bin/murmur \
-              --prefix LD_LIBRARY_PATH : "${runtimeLibPath}" \
-              --set-default WGPU_BACKEND "gl,vulkan"
+              --prefix LD_LIBRARY_PATH : "${runtimeLibPath}"
           '';
         };
 
