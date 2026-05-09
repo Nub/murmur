@@ -150,13 +150,15 @@
         });
 
         # Zip the Windows build
+        webview2Dll = ./assets/WebView2Loader.dll;
+
         murmurWindowsZip = pkgs.runCommand "murmur-windows-zip" {
           nativeBuildInputs = [ pkgs.zip ];
         } ''
           mkdir -p $out murmur-windows
           cp ${murmurWindows}/bin/murmur.exe murmur-windows/ || true
-          # Copy any DLLs that might be needed
           find ${murmurWindows} -name "*.dll" -exec cp {} murmur-windows/ \; 2>/dev/null || true
+          cp ${webview2Dll} murmur-windows/WebView2Loader.dll
           cd murmur-windows/..
           zip -r $out/murmur-windows.zip murmur-windows/
         '';
