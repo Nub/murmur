@@ -67,6 +67,7 @@
         runtimeLibPath = pkgs.lib.makeLibraryPath (with pkgs; [
           libxkbcommon
           wayland
+          libglvnd        # provides libEGL/libGL for wgpu GL backend
           xorg.libX11
           xorg.libXcursor
           xorg.libXrandr
@@ -81,7 +82,8 @@
           buildInputs = [ pkgs.makeWrapper ];
           postBuild = ''
             wrapProgram $out/bin/murmur \
-              --prefix LD_LIBRARY_PATH : "${runtimeLibPath}"
+              --prefix LD_LIBRARY_PATH : "${runtimeLibPath}" \
+              --set-default WGPU_BACKEND "gl,vulkan"
           '';
         };
 
