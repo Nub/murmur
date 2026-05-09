@@ -181,9 +181,34 @@ impl NetworkManager {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        // Listen on all interfaces
-        self.swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
-        self.swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
+        // Try to reuse saved port, fall back to random
+        let data_dir = dirs::data_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("murmur");
+        let port_file = data_dir.join("listen_port");
+        let saved_port: u16 = std::fs::read_to_string(&port_file)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+
+        let tcp_addr = if saved_port > 0 {
+            format!("/ip4/0.0.0.0/tcp/{}", saved_port)
+        } else {
+            "/ip4/0.0.0.0/tcp/0".to_string()
+        };
+        let udp_addr = if saved_port > 0 {
+            format!("/ip4/0.0.0.0/udp/{}/quic-v1", saved_port)
+        } else {
+            "/ip4/0.0.0.0/udp/0/quic-v1".to_string()
+        };
+
+        // Listen — if saved port fails (in use), fall back to random
+        if self.swarm.listen_on(tcp_addr.parse()?).is_err() {
+            self.swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+        }
+        if self.swarm.listen_on(udp_addr.parse()?).is_err() {
+            self.swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
+        }
         self.swarm.listen_on("/ip6/::/tcp/0".parse()?)?;
         self.swarm.listen_on("/ip6/::/udp/0/quic-v1".parse()?)?;
 
@@ -231,6 +256,20 @@ impl NetworkManager {
             info!("Dialing bootstrap node: {}", addr);
             if let Err(e) = self.swarm.dial(addr.clone()) {
                 warn!("Failed to dial bootstrap {}: {}", addr, e);
+            }
+        }
+
+        // Auto-reconnect to previously known peers
+        let peers_file = data_dir.join("known_peers.txt");
+        if let Ok(content) = std::fs::read_to_string(&peers_file) {
+            for line in content.lines() {
+                let line = line.trim();
+                if !line.is_empty() {
+                    if let Ok(addr) = line.parse::<Multiaddr>() {
+                        info!("Auto-reconnecting to saved peer: {}", addr);
+                        let _ = self.swarm.dial(addr);
+                    }
+                }
             }
         }
 
@@ -282,6 +321,29 @@ impl NetworkManager {
     async fn periodic_maintenance(&mut self) {
         self.store_forward.evict_expired();
         let _ = self.swarm.behaviour_mut().kademlia.bootstrap();
+
+        // Retry connecting to saved peers who aren't currently connected
+        let connected: HashSet<PeerId> = self.swarm.connected_peers().cloned().collect();
+        let peers_file = dirs::data_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("murmur")
+            .join("known_peers.txt");
+        if let Ok(content) = std::fs::read_to_string(&peers_file) {
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() { continue; }
+                // Check if we're already connected to this peer
+                let already_connected = line.split("/p2p/").nth(1)
+                    .and_then(|pid_str| pid_str.parse::<PeerId>().ok())
+                    .map(|pid| connected.contains(&pid))
+                    .unwrap_or(false);
+                if !already_connected {
+                    if let Ok(addr) = line.parse::<Multiaddr>() {
+                        let _ = self.swarm.dial(addr);
+                    }
+                }
+            }
+        }
 
         // Send clock sync probes to all voice peers
         if self.voice_engine.is_some() {
@@ -580,9 +642,26 @@ impl NetworkManager {
             }
 
             SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
-                info!("Connection established with {} via {}", peer_id, endpoint.get_remote_address());
+                let remote_addr = endpoint.get_remote_address().clone();
+                info!("Connection established with {} via {}", peer_id, remote_addr);
                 self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                 self.known_peers.insert(peer_id);
+
+                // Save peer address for reconnection on restart
+                let full_addr = format!("{}/p2p/{}", remote_addr, peer_id);
+                let peers_file = dirs::data_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    .join("murmur")
+                    .join("known_peers.txt");
+                // Append if not already in file
+                let existing = std::fs::read_to_string(&peers_file).unwrap_or_default();
+                if !existing.contains(&full_addr) {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&peers_file) {
+                        let _ = writeln!(f, "{}", full_addr);
+                    }
+                }
+
                 let _ = self.event_tx.send(NetEvent::PeerDiscovered {
                     peer_id,
                     name: peer_id.to_string()[..8].to_string(),
@@ -603,16 +682,24 @@ impl NetworkManager {
                 let full_addr = format!("{}/p2p/{}", address, self.local_peer_id);
                 let _ = self.event_tx.send(NetEvent::ListeningOn(full_addr));
 
-                // If we know the public IP and this is a TCP address, also emit the public version
+                // Save the TCP port for reuse on next startup
+                let mut tcp_port: Option<u16> = None;
+                for proto in address.iter() {
+                    if let libp2p::multiaddr::Protocol::Tcp(port) = proto {
+                        tcp_port = Some(port);
+                    }
+                }
+                if let Some(port) = tcp_port {
+                    let port_file = dirs::data_dir()
+                        .unwrap_or_else(|| std::path::PathBuf::from("."))
+                        .join("murmur")
+                        .join("listen_port");
+                    let _ = std::fs::write(&port_file, port.to_string());
+                }
+
+                // If we know the public IP, also emit the public version
                 let pub_ip = self.public_ip.lock().ok().and_then(|g| g.clone());
                 if let Some(ref pub_ip) = pub_ip {
-                    // Extract the TCP port from the address
-                    let mut tcp_port: Option<u16> = None;
-                    for proto in address.iter() {
-                        if let libp2p::multiaddr::Protocol::Tcp(port) = proto {
-                            tcp_port = Some(port);
-                        }
-                    }
                     if let Some(port) = tcp_port {
                         let pub_addr = format!("/ip4/{}/tcp/{}/p2p/{}", pub_ip, port, self.local_peer_id);
                         let _ = self.event_tx.send(NetEvent::ListeningOn(pub_addr));
