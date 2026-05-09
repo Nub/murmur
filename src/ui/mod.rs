@@ -72,6 +72,8 @@ pub enum Message {
     // Tick (for periodic tasks and animations)
     Tick,
     AnimTick,
+    // Clipboard
+    CopyToClipboard(String),
     // No-op (for non-functional items)
     Noop,
 }
@@ -491,6 +493,9 @@ impl MurmurApp {
                 }
             }
 
+            Message::CopyToClipboard(text) => {
+                return iced::clipboard::write(text);
+            }
             Message::Noop => {}
         }
         IcedTask::none()
@@ -1470,13 +1475,22 @@ impl MurmurApp {
             addr_col = addr_col.push(text("Waiting for network...").size(11).color(C::TEXT_MUTED));
         } else {
             for addr in &self.state.listen_addrs {
+                let addr_clone = addr.clone();
                 addr_col = addr_col.push(
-                    container(
+                    button(
                         text(addr.clone()).size(10).color(C::TEXT_DIM),
                     )
+                    .on_press(Message::CopyToClipboard(addr_clone))
                     .padding(Padding::from([3, 6]))
-                    .style(|_t: &Theme| container::Style {
-                        background: Some(C::BG_ELEVATED.into()),
+                    .style(|_t: &Theme, status: button::Status| button::Style {
+                        background: Some(match status {
+                            button::Status::Hovered => Color::from_rgb(0.12, 0.12, 0.12),
+                            _ => C::BG_ELEVATED,
+                        }.into()),
+                        text_color: match status {
+                            button::Status::Hovered => C::TEXT_NORMAL,
+                            _ => C::TEXT_DIM,
+                        },
                         border: iced::Border { radius: 3.0.into(), ..Default::default() },
                         ..Default::default()
                     }),
