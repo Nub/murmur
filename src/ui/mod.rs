@@ -1746,6 +1746,21 @@ impl MurmurApp {
                     vp.speaking = is_speaking;
                 }
             }
+            NetEvent::PeerVoiceJoined { peer_id, name } => {
+                let display_name = self.state.peers.get(&peer_id)
+                    .map(|p| p.display_name.clone())
+                    .unwrap_or_else(|| name[..8.min(name.len())].to_string());
+                self.state.voice_peers.insert(peer_id.clone(), crate::state::VoicePeerState {
+                    peer_id,
+                    display_name,
+                    speaking: false,
+                    muted: false,
+                    deafened: false,
+                });
+            }
+            NetEvent::PeerVoiceLeft { peer_id } => {
+                self.state.voice_peers.remove(&peer_id);
+            }
             NetEvent::Connected => {
                 self.connected = true;
                 for server in &self.state.servers {

@@ -190,6 +190,8 @@ pub enum NetEvent {
         channel: Channel,
     },
     PeerSpeaking { peer_id: String, is_speaking: bool },
+    PeerVoiceJoined { peer_id: String, name: String },
+    PeerVoiceLeft { peer_id: String },
     Connected,
     ListeningOn(String), // multiaddr string
     Error(String),

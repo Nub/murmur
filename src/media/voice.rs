@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
+use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_OPUS};
 use webrtc::api::APIBuilder;
@@ -17,7 +18,7 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
-use webrtc::track::track_local::TrackLocal;
+use webrtc::track::track_local::{TrackLocal, TrackLocalWriter};
 
 const OPUS_SAMPLE_RATE: u32 = 48000;
 const OPUS_CHANNELS: u16 = 1;
@@ -289,6 +290,12 @@ pub struct VoiceEngine {
     pipeline: Arc<Mutex<Option<AudioPipeline>>>,
     playback_buffer: Arc<Mutex<Vec<f32>>>,
     playback_pipeline: Option<PlaybackPipeline>,
+    /// Channel for sending encoded Opus packets from capture thread to RTP writer task
+    rtp_packet_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    /// RTP sequence number (shared with writer task)
+    rtp_seq: Arc<AtomicU16>,
+    /// RTP timestamp counter
+    rtp_ts: Arc<AtomicU32>,
 }
 
 impl VoiceEngine {
@@ -311,6 +318,9 @@ impl VoiceEngine {
             pipeline: Arc::new(Mutex::new(None)),
             playback_buffer: Arc::new(Mutex::new(Vec::with_capacity(48000))),
             playback_pipeline: None,
+            rtp_packet_tx: None,
+            rtp_seq: Arc::new(AtomicU16::new(0)),
+            rtp_ts: Arc::new(AtomicU32::new(0)),
         })
     }
 
@@ -348,6 +358,39 @@ impl VoiceEngine {
         ));
         self.local_audio_track = Some(audio_track.clone());
 
+        // Create channel for sending Opus packets from capture thread to RTP writer
+        let (pkt_tx, mut pkt_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        self.rtp_packet_tx = Some(pkt_tx.clone());
+
+        // Spawn a tokio task that reads encoded packets and writes RTP to the track
+        let track_for_rtp = audio_track.clone();
+        let rtp_seq = self.rtp_seq.clone();
+        let rtp_ts = self.rtp_ts.clone();
+        tokio::spawn(async move {
+            use webrtc::rtp;
+            while let Some(opus_data) = pkt_rx.recv().await {
+                let seq = rtp_seq.fetch_add(1, Ordering::Relaxed);
+                let ts = rtp_ts.fetch_add(OPUS_FRAME_SIZE as u32, Ordering::Relaxed);
+
+                let rtp_packet = rtp::packet::Packet {
+                    header: rtp::header::Header {
+                        version: 2,
+                        payload_type: 111, // Opus dynamic payload type
+                        sequence_number: seq,
+                        timestamp: ts,
+                        ssrc: 1,
+                        ..Default::default()
+                    },
+                    payload: opus_data.into(),
+                };
+
+                if let Err(e) = track_for_rtp.write_rtp(&rtp_packet).await {
+                    // Track might not be connected yet, that's OK
+                    let _ = e;
+                }
+            }
+        });
+
         // Pipeline
         let mut pipe = AudioPipeline::new()?;
         pipe.input_volume = input_volume;
@@ -358,6 +401,8 @@ impl VoiceEngine {
         let pipeline_ref = self.pipeline.clone();
         let needs_resample = sample_rate != OPUS_SAMPLE_RATE;
         let rate_ratio = OPUS_SAMPLE_RATE as f64 / sample_rate as f64;
+        let pkt_tx_f32 = Some(pkt_tx.clone());
+        let pkt_tx_i16 = Some(pkt_tx);
 
         // Build input stream — handle both f32 and i16 sample formats
         let stream = match sample_format {
@@ -365,7 +410,7 @@ impl VoiceEngine {
                 input_device.build_input_stream(
                     &input_config,
                     move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                        process_input_samples(data, channels, needs_resample, rate_ratio, &pipeline_ref);
+                        process_input_samples(data, channels, needs_resample, rate_ratio, &pipeline_ref, &pkt_tx_f32);
                     },
                     |err| error!("Audio input error: {}", err),
                     None,
@@ -376,7 +421,7 @@ impl VoiceEngine {
                     &input_config,
                     move |data: &[i16], _: &cpal::InputCallbackInfo| {
                         let float_data: Vec<f32> = data.iter().map(|&s| s as f32 / 32768.0).collect();
-                        process_input_samples(&float_data, channels, needs_resample, rate_ratio, &pipeline_ref);
+                        process_input_samples(&float_data, channels, needs_resample, rate_ratio, &pipeline_ref, &pkt_tx_i16);
                     },
                     |err| error!("Audio input error: {}", err),
                     None,
@@ -458,12 +503,14 @@ impl VoiceEngine {
         let needs_resample = sample_rate != OPUS_SAMPLE_RATE;
         let rate_ratio = OPUS_SAMPLE_RATE as f64 / sample_rate as f64;
 
+        let no_tx: Option<mpsc::UnboundedSender<Vec<u8>>> = None;
+        let no_tx2: Option<mpsc::UnboundedSender<Vec<u8>>> = None;
         let stream = match sample_format {
             SampleFormat::F32 => {
                 input_device.build_input_stream(
                     &input_config,
                     move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                        process_input_samples(data, channels, needs_resample, rate_ratio, &pipeline_ref);
+                        process_input_samples(data, channels, needs_resample, rate_ratio, &pipeline_ref, &no_tx);
                     },
                     |err| error!("Mic test error: {}", err),
                     None,
@@ -474,7 +521,7 @@ impl VoiceEngine {
                     &input_config,
                     move |data: &[i16], _: &cpal::InputCallbackInfo| {
                         let float_data: Vec<f32> = data.iter().map(|&s| s as f32 / 32768.0).collect();
-                        process_input_samples(&float_data, channels, needs_resample, rate_ratio, &pipeline_ref);
+                        process_input_samples(&float_data, channels, needs_resample, rate_ratio, &pipeline_ref, &no_tx2);
                     },
                     |err| error!("Mic test error: {}", err),
                     None,
@@ -517,6 +564,7 @@ impl VoiceEngine {
     }
 
     pub fn stop_audio_capture(&mut self) {
+        self.rtp_packet_tx = None; // Drops the sender, stopping the RTP writer task
         self.capture_stream = None;
         self.playback_stream = None;
         self.local_audio_track = None;
@@ -628,10 +676,57 @@ impl VoiceEngine {
             })
         }));
 
-        let buf = self.playback_buffer.clone();
+        let playback_buf = self.playback_buffer.clone();
         pc.on_track(Box::new(move |track, _, _| {
-            info!("Remote audio track: {}", track.codec().capability.mime_type);
-            Box::pin(async move { let mut b = vec![0u8; 1500]; loop { if track.read(&mut b).await.is_err() { break; } } })
+            let buf = playback_buf.clone();
+            let codec = track.codec().capability.mime_type.clone();
+            info!("Receiving remote audio track: {}", codec);
+
+            Box::pin(async move {
+                // Create Opus decoder for this incoming track
+                let mut decoder = match opus::Decoder::new(48000, opus::Channels::Mono) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        error!("Failed to create Opus decoder: {}", e);
+                        return;
+                    }
+                };
+                let mut decode_buf = vec![0.0f32; 960 * 2];
+                let mut rtp_buf = vec![0u8; 1500];
+
+                loop {
+                    match track.read(&mut rtp_buf).await {
+                        Ok((rtp_packet, _)) => {
+                            // Extract Opus payload from RTP
+                            let payload_len = rtp_packet.payload.len();
+                            if payload_len == 0 {
+                                continue;
+                            }
+
+                            // Decode Opus to PCM
+                            match decoder.decode_float(&rtp_packet.payload, &mut decode_buf, false) {
+                                Ok(samples) if samples > 0 => {
+                                    if let Ok(mut b) = buf.lock() {
+                                        b.extend_from_slice(&decode_buf[..samples]);
+                                        // Cap buffer at ~500ms to prevent latency buildup
+                                        let max = 48000 / 2;
+                                        if b.len() > max {
+                                            let excess = b.len() - max;
+                                            b.drain(..excess);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    // Occasional decode errors are normal (packet loss)
+                                    let _ = e;
+                                }
+                                _ => {}
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
         }));
 
         Ok(pc)
@@ -646,6 +741,7 @@ fn process_input_samples(
     needs_resample: bool,
     rate_ratio: f64,
     pipeline: &Arc<Mutex<Option<AudioPipeline>>>,
+    packet_tx: &Option<mpsc::UnboundedSender<Vec<u8>>>,
 ) {
     let mono: Vec<f32> = if channels > 1 {
         data.chunks(channels).map(|f| f.iter().sum::<f32>() / channels as f32).collect()
@@ -671,7 +767,13 @@ fn process_input_samples(
 
     if let Ok(mut guard) = pipeline.lock() {
         if let Some(ref mut pipe) = *guard {
-            let _packets = pipe.process(&samples);
+            let packets = pipe.process(&samples);
+            // Send encoded Opus packets to the RTP writer task
+            if let Some(ref tx) = packet_tx {
+                for packet in packets {
+                    let _ = tx.send(packet);
+                }
+            }
         }
     }
 }

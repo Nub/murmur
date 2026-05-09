@@ -15,6 +15,7 @@ use libp2p::{
 };
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -46,6 +47,7 @@ pub struct NetworkManager {
     store_forward: StoreForward,
     bootstrap_addrs: Vec<Multiaddr>,
     known_peers: HashSet<PeerId>,
+    public_ip: Arc<Mutex<Option<String>>>,
     voice_engine: Option<VoiceEngine>,
     voice_event_rx: Option<mpsc::UnboundedReceiver<VoiceEvent>>,
     screen_share: ScreenShare,
@@ -165,6 +167,7 @@ impl NetworkManager {
             store_forward,
             bootstrap_addrs,
             known_peers: HashSet::new(),
+            public_ip: Arc::new(Mutex::new(None)),
             voice_engine: None,
             voice_event_rx: None,
             screen_share: ScreenShare::new(),
@@ -182,6 +185,37 @@ impl NetworkManager {
         self.swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
         self.swarm.listen_on("/ip6/::/tcp/0".parse()?)?;
         self.swarm.listen_on("/ip6/::/udp/0/quic-v1".parse()?)?;
+
+        // Discover public IP in background
+        let event_tx_pub = self.event_tx.clone();
+        let local_pid = self.local_peer_id;
+        let public_ip_ref = self.public_ip.clone();
+        tokio::spawn(async move {
+            if let Ok(Some(public_ip)) = tokio::time::timeout(
+                Duration::from_secs(5),
+                async {
+                    let addrs = tokio::net::lookup_host("api.ipify.org:80").await.ok()?;
+                    let addr = addrs.into_iter().next()?;
+                    let mut stream = tokio::net::TcpStream::connect(addr).await.ok()?;
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    stream.write_all(b"GET / HTTP/1.1\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n").await.ok()?;
+                    let mut buf = vec![0u8; 1024];
+                    let n = stream.read(&mut buf).await.ok()?;
+                    let response = String::from_utf8_lossy(&buf[..n]).to_string();
+                    response.split("\r\n\r\n").nth(1).map(|s| s.trim().to_string())
+                },
+            ).await {
+                info!("Public IP discovered: {}", public_ip);
+                // Store for use by NewListenAddr handler
+                if let Ok(mut pip) = public_ip_ref.lock() {
+                    *pip = Some(public_ip.clone());
+                }
+                // Emit as a displayable address
+                let _ = event_tx_pub.send(NetEvent::ListeningOn(
+                    format!("/ip4/{}/p2p/{}", public_ip, local_pid),
+                ));
+            }
+        });
 
         // Subscribe to the global presence topic
         let presence_topic = gossipsub::IdentTopic::new("murmur/presence");
@@ -461,6 +495,11 @@ impl NetworkManager {
                                 }
                                 VoiceSignalType::Join => {
                                     info!("Peer {} joined voice", peer);
+                                    // Notify UI that this peer joined voice
+                                    let _ = self.event_tx.send(NetEvent::PeerVoiceJoined {
+                                        peer_id: peer.to_string(),
+                                        name: signal.from_peer_id.clone(),
+                                    });
                                     // Initiate WebRTC connection to this peer
                                     match engine.connect_to_peer(&peer.to_string()).await {
                                         Ok(sdp) => {
@@ -481,6 +520,9 @@ impl NetworkManager {
                                     info!("Peer {} left voice", peer);
                                     let _ = engine.disconnect_peer(&peer.to_string()).await;
                                     self.audio_sync.remove_peer(&peer.to_string());
+                                    let _ = self.event_tx.send(NetEvent::PeerVoiceLeft {
+                                        peer_id: peer.to_string(),
+                                    });
                                 }
                                 VoiceSignalType::Speaking { is_speaking } => {
                                     let _ = self.event_tx.send(NetEvent::PeerSpeaking {
@@ -540,6 +582,22 @@ impl NetworkManager {
                 info!("Listening on {}", address);
                 let full_addr = format!("{}/p2p/{}", address, self.local_peer_id);
                 let _ = self.event_tx.send(NetEvent::ListeningOn(full_addr));
+
+                // If we know the public IP and this is a TCP address, also emit the public version
+                let pub_ip = self.public_ip.lock().ok().and_then(|g| g.clone());
+                if let Some(ref pub_ip) = pub_ip {
+                    // Extract the TCP port from the address
+                    let mut tcp_port: Option<u16> = None;
+                    for proto in address.iter() {
+                        if let libp2p::multiaddr::Protocol::Tcp(port) = proto {
+                            tcp_port = Some(port);
+                        }
+                    }
+                    if let Some(port) = tcp_port {
+                        let pub_addr = format!("/ip4/{}/tcp/{}/p2p/{}", pub_ip, port, self.local_peer_id);
+                        let _ = self.event_tx.send(NetEvent::ListeningOn(pub_addr));
+                    }
+                }
             }
 
             // UPnP mapped an external port
@@ -687,7 +745,6 @@ impl NetworkManager {
                 let (voice_tx, voice_rx) = mpsc::unbounded_channel();
                 match VoiceEngine::new(voice_tx) {
                     Ok(mut engine) => {
-                        // Start with default settings — UI can update via UpdateAudioSettings
                         if let Err(e) = engine.start_audio_capture(
                             &None, &None, 1.0, 1.0, true, 0.5,
                         ) {
@@ -696,6 +753,31 @@ impl NetworkManager {
                         self.voice_engine = Some(engine);
                         self.voice_event_rx = Some(voice_rx);
                         info!("Voice engine ready, {} known peers", self.known_peers.len());
+
+                        // Broadcast voice join to all known peers
+                        let peers: Vec<PeerId> = self.known_peers.iter().cloned().collect();
+                        for peer_id in &peers {
+                            let signal = VoiceSignal {
+                                signal_type: VoiceSignalType::Join,
+                                from_peer_id: self.local_peer_id.to_string(),
+                                channel_topic: channel_topic.clone(),
+                            };
+                            self.swarm.behaviour_mut().voice.send_request(peer_id, signal);
+                        }
+
+                        // Also initiate WebRTC connections to all known peers
+                        for peer_id in &peers {
+                            if let Some(ref mut eng) = self.voice_engine {
+                                match eng.connect_to_peer(&peer_id.to_string()).await {
+                                    Ok(_sdp) => {
+                                        info!("Initiated voice connection to {}", peer_id);
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to connect voice to {}: {}", peer_id, e);
+                                    }
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
                         error!("Failed to create voice engine: {}", e);
@@ -705,6 +787,18 @@ impl NetworkManager {
 
             NetCommand::StopVoice => {
                 info!("Stopping voice");
+
+                // Broadcast voice leave to all known peers
+                let peers: Vec<PeerId> = self.known_peers.iter().cloned().collect();
+                for peer_id in &peers {
+                    let signal = VoiceSignal {
+                        signal_type: VoiceSignalType::Leave,
+                        from_peer_id: self.local_peer_id.to_string(),
+                        channel_topic: String::new(),
+                    };
+                    self.swarm.behaviour_mut().voice.send_request(&peer_id, signal);
+                }
+
                 if let Some(mut engine) = self.voice_engine.take() {
                     let _ = engine.disconnect_all().await;
                 }
