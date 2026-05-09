@@ -1,3 +1,4 @@
+use base64::Engine;
 use chrono::{DateTime, Utc};
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
@@ -32,11 +33,31 @@ impl std::fmt::Display for UserStatus {
 
 /// A server (community) is identified by a topic hash.
 /// Anyone who knows the server ID can join - truly decentralized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ServerRole {
+    Owner,
+    Admin,
+    Member,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerMember {
+    pub peer_id: String,
+    pub role: ServerRole,
+    pub addrs: Vec<String>, // known multiaddrs for this peer
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Server {
     pub id: String,
     pub name: String,
     pub channels: Vec<Channel>,
+    /// Known peer addresses for auto-connect
+    #[serde(default)]
+    pub peers: Vec<ServerMember>,
+    /// Who created this server (peer ID)
+    #[serde(default)]
+    pub owner_peer_id: String,
 }
 
 impl Server {
@@ -49,11 +70,71 @@ impl Server {
                 id: "general".to_string(),
                 name: "general".to_string(),
             }],
+            peers: Vec::new(),
+            owner_peer_id: String::new(),
         }
+    }
+
+    pub fn new_owned(name: String, owner_peer_id: String) -> Self {
+        let mut server = Self::new(name);
+        server.owner_peer_id = owner_peer_id.clone();
+        server.peers.push(ServerMember {
+            peer_id: owner_peer_id,
+            role: ServerRole::Owner,
+            addrs: Vec::new(),
+        });
+        server
     }
 
     pub fn topic_for_channel(&self, channel_id: &str) -> String {
         format!("murmur/server/{}/channel/{}", self.id, channel_id)
+    }
+
+    /// Add or update a peer in this server's member list.
+    pub fn add_peer(&mut self, peer_id: &str, addrs: Vec<String>) {
+        if let Some(member) = self.peers.iter_mut().find(|m| m.peer_id == peer_id) {
+            // Merge addresses
+            for addr in addrs {
+                if !member.addrs.contains(&addr) {
+                    member.addrs.push(addr);
+                }
+            }
+        } else {
+            self.peers.push(ServerMember {
+                peer_id: peer_id.to_string(),
+                role: ServerRole::Member,
+                addrs,
+            });
+        }
+    }
+
+    /// Get the role of a peer in this server.
+    pub fn role_of(&self, peer_id: &str) -> ServerRole {
+        self.peers.iter()
+            .find(|m| m.peer_id == peer_id)
+            .map(|m| m.role)
+            .unwrap_or(ServerRole::Member)
+    }
+
+    /// Generate an invite code (base64 encoded server name + peer addresses).
+    pub fn invite_code(&self) -> String {
+        let addrs: Vec<&str> = self.peers.iter()
+            .flat_map(|m| m.addrs.iter().map(|a| a.as_str()))
+            .collect();
+        let invite = format!("{}|{}", self.name, addrs.join(","));
+        base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, invite.as_bytes())
+    }
+
+    /// Parse an invite code back into server name + peer addresses.
+    pub fn parse_invite(code: &str) -> Option<(String, Vec<String>)> {
+        let bytes = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, code).ok()?;
+        let s = String::from_utf8(bytes).ok()?;
+        let mut parts = s.splitn(2, '|');
+        let name = parts.next()?.to_string();
+        let addrs: Vec<String> = parts.next()
+            .map(|a| a.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect())
+            .unwrap_or_default();
+        Some((name, addrs))
     }
 }
 

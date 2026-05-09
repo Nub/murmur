@@ -212,12 +212,18 @@ impl MurmurApp {
                 self.state.active_server = Some(idx);
                 self.state.active_channel = Some(0);
                 self.state.active_dm_peer = None;
+                if let Some(topic) = self.state.current_topic() {
+                    self.state.load_messages_for_topic(&topic);
+                }
                 self.subscribe_to_current_channel();
             }
 
             Message::SelectChannel(idx) => {
                 self.state.active_channel = Some(idx);
                 self.state.active_dm_peer = None;
+                if let Some(topic) = self.state.current_topic() {
+                    self.state.load_messages_for_topic(&topic);
+                }
                 self.subscribe_to_current_channel();
             }
 
@@ -314,16 +320,31 @@ impl MurmurApp {
                 }
                 match self.modal {
                     ActiveModal::CreateServer => {
-                        let server = Server::new(input);
+                        let server = Server::new_owned(input, self.state.profile.peer_id.clone());
                         let topic = server.topic_for_channel("general");
                         self.state.add_server(server);
                         let _ = self.net_cmd_tx.send(NetCommand::JoinServer(topic));
                     }
                     ActiveModal::JoinServer => {
-                        let server = Server::new(input);
-                        let topic = server.topic_for_channel("general");
-                        self.state.add_server(server);
-                        let _ = self.net_cmd_tx.send(NetCommand::JoinServer(topic));
+                        // Try to parse as invite code first, fall back to server name
+                        if let Some((name, addrs)) = Server::parse_invite(&input) {
+                            let mut server = Server::new(name);
+                            // Connect to all peers from the invite
+                            for addr_str in &addrs {
+                                if let Ok(addr) = addr_str.parse() {
+                                    let _ = self.net_cmd_tx.send(NetCommand::Dial(addr));
+                                }
+                                server.add_peer("unknown", vec![addr_str.clone()]);
+                            }
+                            let topic = server.topic_for_channel("general");
+                            self.state.add_server(server);
+                            let _ = self.net_cmd_tx.send(NetCommand::JoinServer(topic));
+                        } else {
+                            let server = Server::new(input);
+                            let topic = server.topic_for_channel("general");
+                            self.state.add_server(server);
+                            let _ = self.net_cmd_tx.send(NetCommand::JoinServer(topic));
+                        }
                     }
                     ActiveModal::CreateChannel => {
                         if let Some(si) = self.state.active_server {

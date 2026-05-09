@@ -232,8 +232,27 @@ impl AppState {
             return;
         }
         if let Ok(Some(data)) = self.db.get(format!("msgs:{}", topic)) {
-            if let Ok(msgs) = bincode::deserialize::<Vec<ChatMessage>>(&data) {
+            if let Ok(mut msgs) = bincode::deserialize::<Vec<ChatMessage>>(&data) {
+                // Messages were stored in reverse order, fix that
+                msgs.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
                 self.messages.insert(topic.to_string(), msgs);
+            }
+        }
+    }
+
+    /// Load all saved message history for all server channels.
+    pub fn load_all_history(&mut self) {
+        let topics: Vec<String> = self.servers.iter().flat_map(|s| {
+            s.channels.iter().map(move |c| s.topic_for_channel(&c.id))
+        }).collect();
+        for topic in topics {
+            self.load_messages_for_topic(&topic);
+        }
+        // Also load DM history
+        for entry in self.db.scan_prefix("msgs:") {
+            if let Ok((key, _)) = entry {
+                let topic = String::from_utf8_lossy(&key["msgs:".len()..]).to_string();
+                self.load_messages_for_topic(&topic);
             }
         }
     }

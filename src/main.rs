@@ -151,6 +151,18 @@ fn run() -> Result<()> {
     });
 
     let mut state = AppState::new(peer_id.to_string(), display_name)?;
+    state.load_all_history();
+
+    // Auto-connect to all known server peers
+    for server in &state.servers {
+        for member in &server.peers {
+            for addr_str in &member.addrs {
+                if let Ok(addr) = addr_str.parse::<libp2p::Multiaddr>() {
+                    let _ = net_cmd_tx.send(NetCommand::Dial(addr));
+                }
+            }
+        }
+    }
 
     // Test UI mode: populate fake data for visual testing
     let test_scene = std::env::var("MURMUR_TEST_UI").ok();
