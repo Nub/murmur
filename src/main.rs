@@ -170,10 +170,14 @@ fn run() -> Result<()> {
     }
 
     // Run the egui GUI
+    // Use wgpu renderer — works on more systems than glow (no EGL needed)
+    let renderer = eframe::Renderer::Wgpu;
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
             .with_title("murmur"),
+        renderer,
         ..Default::default()
     };
 
