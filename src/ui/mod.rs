@@ -349,8 +349,14 @@ impl MurmurApp {
                         ));
                     }
                     ActiveModal::ConnectPeer => {
-                        if let Ok(addr) = input.parse() {
-                            let _ = self.net_cmd_tx.send(NetCommand::Dial(addr));
+                        match input.parse::<libp2p::Multiaddr>() {
+                            Ok(addr) => {
+                                tracing::info!("Connecting to: {}", addr);
+                                let _ = self.net_cmd_tx.send(NetCommand::Dial(addr));
+                            }
+                            Err(e) => {
+                                tracing::error!("Invalid address '{}': {}", input, e);
+                            }
                         }
                     }
                     ActiveModal::None | ActiveModal::Settings => {}

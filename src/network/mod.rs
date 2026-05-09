@@ -517,6 +517,25 @@ impl NetworkManager {
                 }
             }
 
+            SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                info!("Connection established with {} via {}", peer_id, endpoint.get_remote_address());
+                self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                self.known_peers.insert(peer_id);
+                let _ = self.event_tx.send(NetEvent::PeerDiscovered {
+                    peer_id,
+                    name: peer_id.to_string()[..8].to_string(),
+                });
+            }
+
+            SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                info!("Connection closed with {}", peer_id);
+            }
+
+            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                error!("Outgoing connection error to {:?}: {}", peer_id, error);
+                let _ = self.event_tx.send(NetEvent::Error(format!("Connection failed: {}", error)));
+            }
+
             SwarmEvent::NewListenAddr { address, .. } => {
                 info!("Listening on {}", address);
                 let full_addr = format!("{}/p2p/{}", address, self.local_peer_id);
@@ -628,8 +647,34 @@ impl NetworkManager {
             }
 
             NetCommand::Dial(addr) => {
-                if let Err(e) = self.swarm.dial(addr.clone()) {
-                    error!("Failed to dial {}: {}", addr, e);
+                info!("Dialing peer: {}", addr);
+                // Extract peer ID from the multiaddr if present (last /p2p/ component)
+                let peer_id = addr.iter().find_map(|proto| {
+                    if let libp2p::multiaddr::Protocol::P2p(id) = proto {
+                        Some(id)
+                    } else {
+                        None
+                    }
+                });
+
+                match self.swarm.dial(addr.clone()) {
+                    Ok(()) => {
+                        info!("Dial initiated to {}", addr);
+                        // If we know the peer ID, add them to gossipsub + kademlia immediately
+                        if let Some(pid) = peer_id {
+                            self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&pid);
+                            self.swarm.behaviour_mut().kademlia.add_address(&pid, addr.clone());
+                            self.known_peers.insert(pid);
+                            let _ = self.event_tx.send(NetEvent::PeerDiscovered {
+                                peer_id: pid,
+                                name: pid.to_string()[..8].to_string(),
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to dial {}: {}", addr, e);
+                        let _ = self.event_tx.send(NetEvent::Error(format!("Failed to connect: {}", e)));
+                    }
                 }
             }
 
