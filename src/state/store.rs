@@ -42,6 +42,16 @@ pub struct AudioSettings {
     pub mic_level: f32,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AudioSettingsPersist {
+    input_device: Option<String>,
+    output_device: Option<String>,
+    input_volume: f32,
+    output_volume: f32,
+    noise_suppression: bool,
+    vad_threshold: f32,
+}
+
 impl Default for AudioSettings {
     fn default() -> Self {
         Self {
@@ -85,6 +95,10 @@ pub struct AppState {
     pub audio: AudioSettings,
     /// Our listening addresses (for sharing with friends)
     pub listen_addrs: Vec<String>,
+    /// Unread message count per topic
+    pub unread: HashMap<String, u32>,
+    /// Total unread count (for window title)
+    pub total_unread: u32,
 }
 
 impl AppState {
@@ -147,6 +161,8 @@ impl AppState {
             voice_channel_name: None,
             audio: AudioSettings::default(),
             listen_addrs: Vec::new(),
+            unread: HashMap::new(),
+            total_unread: 0,
         })
     }
 
@@ -181,9 +197,22 @@ impl AppState {
             "murmur/server/{}/channel/{}",
             msg.server_id, msg.channel_id
         );
+        // Track unread if not from us and not the active channel
+        let is_from_us = msg.sender_peer_id == self.profile.peer_id;
+        let is_active = self.current_topic().as_ref() == Some(&topic);
+        if !is_from_us && !is_active {
+            *self.unread.entry(topic.clone()).or_insert(0) += 1;
+            self.total_unread += 1;
+        }
         self.messages.entry(topic.clone()).or_default().push(msg.clone());
-        // Persist last N messages
         self.persist_messages(&topic);
+    }
+
+    /// Clear unread count for a topic (called when switching to that channel).
+    pub fn mark_read(&mut self, topic: &str) {
+        if let Some(count) = self.unread.remove(topic) {
+            self.total_unread = self.total_unread.saturating_sub(count);
+        }
     }
 
     pub fn add_direct_message(&mut self, msg: DirectMessage) {
@@ -273,6 +302,32 @@ impl AppState {
         let profiles: Vec<UserProfile> = self.peers.values().cloned().collect();
         if let Ok(data) = bincode::serialize(&profiles) {
             let _ = self.db.insert("peers", data);
+        }
+    }
+
+    pub fn save_audio_settings(&self) {
+        if let Ok(data) = serde_json::to_vec(&AudioSettingsPersist {
+            input_device: self.audio.input_device.clone(),
+            output_device: self.audio.output_device.clone(),
+            input_volume: self.audio.input_volume,
+            output_volume: self.audio.output_volume,
+            noise_suppression: self.audio.noise_suppression,
+            vad_threshold: self.audio.vad_threshold,
+        }) {
+            let _ = self.db.insert("audio_settings", data);
+        }
+    }
+
+    pub fn load_audio_settings(&mut self) {
+        if let Ok(Some(data)) = self.db.get("audio_settings") {
+            if let Ok(s) = serde_json::from_slice::<AudioSettingsPersist>(&data) {
+                self.audio.input_device = s.input_device;
+                self.audio.output_device = s.output_device;
+                self.audio.input_volume = s.input_volume;
+                self.audio.output_volume = s.output_volume;
+                self.audio.noise_suppression = s.noise_suppression;
+                self.audio.vad_threshold = s.vad_threshold;
+            }
         }
     }
 

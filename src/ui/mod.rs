@@ -147,7 +147,11 @@ impl MurmurApp {
         } else {
             &self.state.profile.peer_id
         };
-        format!("murmur - {} [{}]", self.state.profile.display_name, peer_short)
+        if self.state.total_unread > 0 {
+            format!("murmur ({}) - {} [{}]", self.state.total_unread, self.state.profile.display_name, peer_short)
+        } else {
+            format!("murmur - {} [{}]", self.state.profile.display_name, peer_short)
+        }
     }
 
     // ── Update ──────────────────────────────────────────────────────────
@@ -166,6 +170,15 @@ impl MurmurApp {
         match message {
             Message::InputChanged(val) => {
                 self.state.input_buffer = val;
+                // Send typing indicator (debounced by anim tick)
+                if !self.state.input_buffer.is_empty() {
+                    if let Some(topic) = self.state.current_topic() {
+                        let _ = self.net_cmd_tx.send(NetCommand::SendTyping {
+                            topic,
+                            name: self.state.profile.display_name.clone(),
+                        });
+                    }
+                }
             }
 
             Message::SendMessage => {
@@ -214,6 +227,7 @@ impl MurmurApp {
                 self.state.active_dm_peer = None;
                 if let Some(topic) = self.state.current_topic() {
                     self.state.load_messages_for_topic(&topic);
+                    self.state.mark_read(&topic);
                 }
                 self.subscribe_to_current_channel();
             }
@@ -223,6 +237,7 @@ impl MurmurApp {
                 self.state.active_dm_peer = None;
                 if let Some(topic) = self.state.current_topic() {
                     self.state.load_messages_for_topic(&topic);
+                    self.state.mark_read(&topic);
                 }
                 self.subscribe_to_current_channel();
             }
@@ -268,21 +283,27 @@ impl MurmurApp {
 
             Message::SetInputDevice(name) => {
                 self.state.audio.input_device = if name == "Default" { None } else { Some(name) };
+                self.state.save_audio_settings();
             }
             Message::SetOutputDevice(name) => {
                 self.state.audio.output_device = if name == "Default" { None } else { Some(name) };
+                self.state.save_audio_settings();
             }
             Message::SetInputVolume(v) => {
                 self.state.audio.input_volume = v;
+                self.state.save_audio_settings();
             }
             Message::SetOutputVolume(v) => {
                 self.state.audio.output_volume = v;
+                self.state.save_audio_settings();
             }
             Message::ToggleNoiseSuppression => {
                 self.state.audio.noise_suppression = !self.state.audio.noise_suppression;
+                self.state.save_audio_settings();
             }
             Message::SetVadThreshold(v) => {
                 self.state.audio.vad_threshold = v;
+                self.state.save_audio_settings();
             }
             Message::StartMicTest => {
                 match crate::media::MicTester::start(
@@ -518,6 +539,10 @@ impl MurmurApp {
                 if let Some(ref tester) = self.mic_tester {
                     self.state.audio.mic_level = tester.level();
                 }
+                // Clear typing indicators every ~3 seconds (12 ticks * 250ms)
+                if self.anim_tick % 12 == 0 {
+                    self.typing_names.clear();
+                }
             }
 
             Message::CopyToClipboard(text) => {
@@ -721,8 +746,10 @@ impl MurmurApp {
                 for (i, channel) in server.channels.iter().enumerate() {
                     let is_active = self.state.active_channel == Some(i)
                         && self.state.active_dm_peer.is_none();
+                    let topic = server.topic_for_channel(&channel.id);
+                    let unread = self.state.unread.get(&topic).copied().unwrap_or(0);
                     sidebar = sidebar.push(
-                        container(channel_item(&channel.name, i, is_active, 0))
+                        container(channel_item(&channel.name, i, is_active, unread))
                             .padding(pad4(0.0, 8.0, 0.0, 8.0)),
                     );
                 }
@@ -1765,6 +1792,11 @@ impl MurmurApp {
             NetEvent::PeerSpeaking { peer_id, is_speaking } => {
                 if let Some(vp) = self.state.voice_peers.get_mut(&peer_id) {
                     vp.speaking = is_speaking;
+                }
+            }
+            NetEvent::PeerTyping { peer_id: _, name } => {
+                if !self.typing_names.contains(&name) {
+                    self.typing_names.push(name);
                 }
             }
             NetEvent::PeerVoiceJoined { peer_id, name } => {

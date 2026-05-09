@@ -31,6 +31,7 @@ pub enum NetCommand {
     CreateChannel { server_id: String, channel: Channel },
     UpdatePresence(UserStatus),
     Dial(Multiaddr),
+    SendTyping { topic: String, name: String },
     StartVoice(String),    // channel topic
     StopVoice,
     StartScreenShare(String),
@@ -370,6 +371,10 @@ impl NetworkManager {
                             server_id,
                             channel,
                         });
+                    }
+                    Ok(NetworkMessage::Typing { peer_id, name, channel_topic }) => {
+                        // Only show if we're on the same channel
+                        let _ = self.event_tx.send(NetEvent::PeerTyping { peer_id, name });
                     }
                     Ok(_) => {}
                     Err(e) => {
@@ -733,6 +738,18 @@ impl NetworkManager {
                         error!("Failed to dial {}: {}", addr, e);
                         let _ = self.event_tx.send(NetEvent::Error(format!("Failed to connect: {}", e)));
                     }
+                }
+            }
+
+            NetCommand::SendTyping { topic, name } => {
+                let net_msg = NetworkMessage::Typing {
+                    peer_id: self.local_peer_id.to_string(),
+                    name,
+                    channel_topic: topic.clone(),
+                };
+                if let Ok(data) = serde_json::to_vec(&net_msg) {
+                    let gossip_topic = gossipsub::IdentTopic::new(&topic);
+                    let _ = self.swarm.behaviour_mut().gossipsub.publish(gossip_topic, data);
                 }
             }
 

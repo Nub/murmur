@@ -244,6 +244,11 @@ pub enum NetworkMessage {
         server_id: String,
         channel: Channel,
     },
+    Typing {
+        peer_id: String,
+        name: String,
+        channel_topic: String,
+    },
 }
 
 /// Events from the network layer to the UI.
@@ -271,6 +276,7 @@ pub enum NetEvent {
         channel: Channel,
     },
     PeerSpeaking { peer_id: String, is_speaking: bool },
+    PeerTyping { peer_id: String, name: String },
     PeerVoiceJoined { peer_id: String, name: String },
     PeerVoiceLeft { peer_id: String },
     Connected,

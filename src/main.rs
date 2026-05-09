@@ -152,6 +152,7 @@ fn run() -> Result<()> {
 
     let mut state = AppState::new(peer_id.to_string(), display_name)?;
     state.load_all_history();
+    state.load_audio_settings();
 
     // Auto-connect to all known server peers
     for server in &state.servers {
