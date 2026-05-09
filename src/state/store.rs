@@ -240,6 +240,47 @@ impl AppState {
         }
     }
 
+    /// Search messages across all channels.
+    pub fn search_messages(&self, query: &str) -> Vec<ChatMessage> {
+        let query_lower = query.to_lowercase();
+        let mut results = Vec::new();
+        for msgs in self.messages.values() {
+            for msg in msgs {
+                if msg.content.to_lowercase().contains(&query_lower)
+                    || msg.sender_name.to_lowercase().contains(&query_lower)
+                {
+                    results.push(msg.clone());
+                }
+            }
+        }
+        results.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        results.truncate(50); // max 50 results
+        results
+    }
+
+    /// Toggle a reaction on a message.
+    pub fn toggle_reaction(&mut self, msg_id: &str, emoji: &str, peer_id: &str) {
+        let mut changed_topic: Option<String> = None;
+        for msgs in self.messages.values_mut() {
+            if let Some(msg) = msgs.iter_mut().find(|m| m.id == msg_id) {
+                let peers = msg.reactions.entry(emoji.to_string()).or_default();
+                if let Some(pos) = peers.iter().position(|p| p == peer_id) {
+                    peers.remove(pos);
+                    if peers.is_empty() {
+                        msg.reactions.remove(emoji);
+                    }
+                } else {
+                    peers.push(peer_id.to_string());
+                }
+                changed_topic = Some(format!("murmur/server/{}/channel/{}", msg.server_id, msg.channel_id));
+                break;
+            }
+        }
+        if let Some(topic) = changed_topic {
+            self.persist_messages(&topic);
+        }
+    }
+
     /// Find a message by ID across all topics.
     pub fn find_message(&self, msg_id: &str) -> Option<&ChatMessage> {
         for msgs in self.messages.values() {

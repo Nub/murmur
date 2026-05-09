@@ -57,6 +57,7 @@ pub enum Message {
     DeleteMessage(String),         // msg_id
     ReplyTo(String),               // msg_id — sets reply context
     CancelReply,
+    ReactToMessage(String, String), // msg_id, emoji
     // Connect to peer
     ConnectToPeer,
     ConnectAddrInput(String),
@@ -79,6 +80,10 @@ pub enum Message {
     AnimTick,
     // Clipboard
     CopyToClipboard(String),
+    // Search
+    OpenSearch,
+    SearchInput(String),
+    CloseSearch,
     // Keyboard
     EscapePressed,
     // No-op (for non-functional items)
@@ -118,6 +123,9 @@ pub struct MurmurApp {
     typing_names: Vec<String>,
     mic_tester: Option<crate::media::MicTester>,
     reply_to_id: Option<String>,
+    search_query: String,
+    search_results: Vec<crate::types::ChatMessage>,
+    search_open: bool,
 }
 
 impl MurmurApp {
@@ -146,6 +154,9 @@ impl MurmurApp {
             typing_names: Vec::new(),
             mic_tester: None,
             reply_to_id: None,
+            search_query: String::new(),
+            search_results: Vec::new(),
+            search_open: false,
         };
         (app, IcedTask::none())
     }
@@ -304,6 +315,10 @@ impl MurmurApp {
 
             Message::CancelReply => {
                 self.reply_to_id = None;
+            }
+
+            Message::ReactToMessage(msg_id, emoji) => {
+                self.state.toggle_reaction(&msg_id, &emoji, &self.state.profile.peer_id.clone());
             }
 
             Message::ConnectToPeer => {
@@ -585,9 +600,29 @@ impl MurmurApp {
                 }
             }
 
+            Message::OpenSearch => {
+                self.search_open = true;
+                self.search_query.clear();
+                self.search_results.clear();
+            }
+            Message::SearchInput(query) => {
+                self.search_query = query.clone();
+                if query.len() >= 2 {
+                    self.search_results = self.state.search_messages(&query);
+                } else {
+                    self.search_results.clear();
+                }
+            }
+            Message::CloseSearch => {
+                self.search_open = false;
+                self.search_query.clear();
+                self.search_results.clear();
+            }
             Message::EscapePressed => {
                 if self.modal != ActiveModal::None {
                     self.modal = ActiveModal::None;
+                } else if self.search_open {
+                    self.search_open = false;
                 } else if self.context_menu.is_some() {
                     self.context_menu = None;
                 } else if self.reply_to_id.is_some() {
@@ -606,12 +641,18 @@ impl MurmurApp {
 
     pub fn view(&self) -> Element<Message> {
         // New layout: column![topbar, row![sidebar, main, members]]
+        let right_panel: Element<Message> = if self.search_open {
+            self.view_search_panel()
+        } else {
+            self.view_member_sidebar()
+        };
+
         let content = column![
             self.view_topbar(),
             row![
                 self.view_channel_sidebar(),
                 self.view_main_area(),
-                self.view_member_sidebar(),
+                right_panel,
             ].height(Length::Fill),
         ];
 
@@ -662,10 +703,13 @@ impl MurmurApp {
             iced::time::every(std::time::Duration::from_secs(30)).map(|_| Message::Tick),
             iced::time::every(std::time::Duration::from_millis(250)).map(|_| Message::AnimTick),
             // Keyboard shortcuts
-            iced::keyboard::on_key_press(|key, _modifiers| {
+            iced::keyboard::on_key_press(|key, modifiers| {
                 match key {
                     iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape) => {
                         Some(Message::EscapePressed)
+                    }
+                    iced::keyboard::Key::Character(ref c) if c.as_str() == "k" && modifiers.command() => {
+                        Some(Message::OpenSearch)
                     }
                     _ => None,
                 }
@@ -1119,6 +1163,11 @@ impl MurmurApp {
                             .size(13)
                             .color(C::TEXT_MUTED),
                         horizontal_space(),
+                        button(text("search").size(11).color(C::TEXT_FAINT))
+                            .on_press(Message::OpenSearch)
+                            .style(theme::icon_button)
+                            .padding(Padding::from([4, 8])),
+                        Space::with_width(4),
                         connection_badge(self.connected),
                     ]
                     .align_y(iced::Alignment::Center)
@@ -1809,6 +1858,92 @@ impl MurmurApp {
         .into()
     }
 
+    // ── Search panel ─────────────────────────────────────────────────
+
+    fn view_search_panel(&self) -> Element<Message> {
+        let mut panel = Column::new().spacing(4).width(240).padding(Padding::from([0, 8]));
+
+        // Header with close button
+        panel = panel.push(
+            container(
+                row![
+                    text("Search").size(13).color(C::TEXT_BRIGHT),
+                    horizontal_space(),
+                    button(text("x").size(12).color(C::TEXT_FAINT))
+                        .on_press(Message::CloseSearch)
+                        .style(theme::icon_button)
+                        .padding(Padding::from([2, 6])),
+                ]
+                .align_y(iced::Alignment::Center),
+            )
+            .padding(Padding::from([12, 8])),
+        );
+
+        // Search input
+        panel = panel.push(
+            container(
+                text_input("search messages...", &self.search_query)
+                    .on_input(Message::SearchInput)
+                    .size(12)
+                    .padding(Padding::from([6, 8]))
+                    .style(theme::modal_input),
+            )
+            .padding(Padding::from([0, 8])),
+        );
+
+        panel = panel.push(Space::with_height(8));
+
+        // Results
+        if self.search_results.is_empty() && self.search_query.len() >= 2 {
+            panel = panel.push(
+                container(text("No results").size(11).color(C::TEXT_FAINT))
+                    .padding(Padding::from([8, 8])),
+            );
+        }
+
+        let mut results_col = Column::new().spacing(2);
+        for msg in &self.search_results {
+            let name = msg.sender_name.clone();
+            let content = if msg.content.len() > 60 {
+                format!("{}...", &msg.content[..60])
+            } else {
+                msg.content.clone()
+            };
+            let time = msg.timestamp.format("%m/%d %H:%M").to_string();
+
+            results_col = results_col.push(
+                container(
+                    column![
+                        row![
+                            text(name).size(11).color(C::TEXT_NORMAL),
+                            Space::with_width(4),
+                            text(time).size(9).color(C::TEXT_FAINT),
+                        ].align_y(iced::Alignment::Center),
+                        text(content).size(11).color(C::TEXT_DIM),
+                    ]
+                    .spacing(2),
+                )
+                .padding(Padding::from([4, 8]))
+                .width(Length::Fill)
+                .style(|_t: &Theme| container::Style {
+                    border: iced::Border {
+                        width: 0.0,
+                        radius: 4.0.into(),
+                        color: Color::TRANSPARENT,
+                    },
+                    ..Default::default()
+                }),
+            );
+        }
+
+        panel = panel.push(scrollable(results_col).height(Length::Fill));
+
+        container(panel)
+            .height(Length::Fill)
+            .style(theme::member_panel)
+            .into()
+    }
+
     fn handle_net_event(&mut self, event: NetEvent) {
         match event {
             NetEvent::MessageReceived(msg) => {
@@ -1856,6 +1991,9 @@ impl MurmurApp {
             }
             NetEvent::MessageDeleted { message_id, peer_id } => {
                 self.state.delete_message(&message_id, &peer_id);
+            }
+            NetEvent::MessageReaction { message_id, emoji, peer_id } => {
+                self.state.toggle_reaction(&message_id, &emoji, &peer_id);
             }
             NetEvent::PeerTyping { peer_id: _, name } => {
                 if !self.typing_names.contains(&name) {

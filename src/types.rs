@@ -162,6 +162,9 @@ pub struct ChatMessage {
     /// Whether this message has been edited
     #[serde(default)]
     pub edited: bool,
+    /// Reactions: emoji -> list of peer IDs who reacted
+    #[serde(default)]
+    pub reactions: std::collections::HashMap<String, Vec<String>>,
 }
 
 impl ChatMessage {
@@ -182,6 +185,7 @@ impl ChatMessage {
             timestamp: Utc::now(),
             reply_to: None,
             edited: false,
+            reactions: std::collections::HashMap::new(),
         }
     }
 }
@@ -266,6 +270,11 @@ pub enum NetworkMessage {
         message_id: String,
         peer_id: String,
     },
+    MessageReaction {
+        message_id: String,
+        emoji: String,
+        peer_id: String,
+    },
 }
 
 /// Events from the network layer to the UI.
@@ -296,6 +305,7 @@ pub enum NetEvent {
     PeerTyping { peer_id: String, name: String },
     MessageEdited { message_id: String, new_content: String, peer_id: String },
     MessageDeleted { message_id: String, peer_id: String },
+    MessageReaction { message_id: String, emoji: String, peer_id: String },
     PeerVoiceJoined { peer_id: String, name: String },
     PeerVoiceLeft { peer_id: String },
     Connected,

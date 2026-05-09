@@ -225,6 +225,32 @@ pub fn message_widget<'a>(
         msg_col = msg_col.push(header_row);
         msg_col = msg_col.push(text(content).size(13).color(C::TEXT_DIM));
 
+        // Show reactions
+        if !msg.reactions.is_empty() {
+            let mut reaction_row = iced::widget::Row::new().spacing(4);
+            for (emoji, peers) in &msg.reactions {
+                let count = peers.len();
+                let label = format!("{} {}", emoji, count);
+                let msg_id = msg.id.clone();
+                let emoji_clone = emoji.clone();
+                reaction_row = reaction_row.push(
+                    button(text(label).size(10).color(C::TEXT_DIM))
+                        .on_press(Message::ReactToMessage(msg_id, emoji_clone))
+                        .padding(Padding::from([2, 6]))
+                        .style(|_t: &iced::Theme, status: button::Status| button::Style {
+                            background: Some(match status {
+                                button::Status::Hovered => Color::from_rgb(0.12, 0.12, 0.12),
+                                _ => C::BG_ELEVATED,
+                            }.into()),
+                            text_color: C::TEXT_DIM,
+                            border: iced::Border { radius: 4.0.into(), ..Default::default() },
+                            ..Default::default()
+                        }),
+                );
+            }
+            msg_col = msg_col.push(reaction_row);
+        }
+
         container(
             row![
                 avatar(&msg.sender_name, 34.0, None),
