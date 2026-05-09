@@ -177,6 +177,8 @@ pub fn message_widget<'a>(
     let timestamp = msg.timestamp.format("%H:%M").to_string();
     let sender = msg.sender_name.clone();
     let content = msg.content.clone();
+    let edited = msg.edited;
+    let has_reply = msg.reply_to.is_some();
 
     if is_continuation {
         container(
@@ -190,20 +192,44 @@ pub fn message_widget<'a>(
         .width(Length::Fill)
         .into()
     } else {
+        let mut header_row = row![
+            text(sender).size(12).color(C::TEXT_NORMAL),
+            Space::with_width(6),
+            text(timestamp).size(9).color(C::TEXT_FAINT),
+            Space::with_width(4),
+            text("e2e").size(8).color(C::TEXT_GHOST),
+        ].align_y(iced::Alignment::Center);
+
+        if edited {
+            header_row = header_row.push(Space::with_width(4));
+            header_row = header_row.push(text("(edited)").size(9).color(C::TEXT_FAINT));
+        }
+
+        let mut msg_col = Column::new().spacing(3);
+
+        // Show reply context if present
+        if has_reply {
+            msg_col = msg_col.push(
+                container(
+                    text("replying to a message").size(10).color(C::TEXT_FAINT),
+                )
+                .padding(pad4(2.0, 8.0, 2.0, 8.0))
+                .style(|_t: &iced::Theme| container::Style {
+                    background: Some(C::BG_ELEVATED.into()),
+                    border: iced::Border { radius: 3.0.into(), ..Default::default() },
+                    ..Default::default()
+                }),
+            );
+        }
+
+        msg_col = msg_col.push(header_row);
+        msg_col = msg_col.push(text(content).size(13).color(C::TEXT_DIM));
+
         container(
             row![
-                avatar(&sender, 34.0, None),
+                avatar(&msg.sender_name, 34.0, None),
                 Space::with_width(10),
-                column![
-                    row![
-                        text(sender).size(12).color(C::TEXT_NORMAL),
-                        Space::with_width(6),
-                        text(timestamp).size(9).color(C::TEXT_FAINT),
-                        Space::with_width(4),
-                        text("e2e").size(8).color(C::TEXT_GHOST),
-                    ].align_y(iced::Alignment::Center),
-                    text(content).size(13).color(C::TEXT_DIM),
-                ].spacing(3),
+                msg_col,
             ].align_y(iced::Alignment::Start),
         )
         .padding(pad4(5.0, 24.0, 5.0, 24.0))

@@ -372,6 +372,16 @@ impl NetworkManager {
                             channel,
                         });
                     }
+                    Ok(NetworkMessage::MessageEdit { message_id, new_content, peer_id }) => {
+                        let _ = self.event_tx.send(NetEvent::MessageEdited {
+                            message_id, new_content, peer_id,
+                        });
+                    }
+                    Ok(NetworkMessage::MessageDelete { message_id, peer_id }) => {
+                        let _ = self.event_tx.send(NetEvent::MessageDeleted {
+                            message_id, peer_id,
+                        });
+                    }
                     Ok(NetworkMessage::Typing { peer_id, name, channel_topic }) => {
                         // Only show if we're on the same channel
                         let _ = self.event_tx.send(NetEvent::PeerTyping { peer_id, name });

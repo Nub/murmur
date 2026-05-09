@@ -156,6 +156,12 @@ pub struct ChatMessage {
     pub sender_name: String,
     pub content: String,
     pub timestamp: DateTime<Utc>,
+    /// ID of the message this is replying to (if any)
+    #[serde(default)]
+    pub reply_to: Option<String>,
+    /// Whether this message has been edited
+    #[serde(default)]
+    pub edited: bool,
 }
 
 impl ChatMessage {
@@ -174,6 +180,8 @@ impl ChatMessage {
             sender_name,
             content,
             timestamp: Utc::now(),
+            reply_to: None,
+            edited: false,
         }
     }
 }
@@ -249,6 +257,15 @@ pub enum NetworkMessage {
         name: String,
         channel_topic: String,
     },
+    MessageEdit {
+        message_id: String,
+        new_content: String,
+        peer_id: String,
+    },
+    MessageDelete {
+        message_id: String,
+        peer_id: String,
+    },
 }
 
 /// Events from the network layer to the UI.
@@ -277,6 +294,8 @@ pub enum NetEvent {
     },
     PeerSpeaking { peer_id: String, is_speaking: bool },
     PeerTyping { peer_id: String, name: String },
+    MessageEdited { message_id: String, new_content: String, peer_id: String },
+    MessageDeleted { message_id: String, peer_id: String },
     PeerVoiceJoined { peer_id: String, name: String },
     PeerVoiceLeft { peer_id: String },
     Connected,

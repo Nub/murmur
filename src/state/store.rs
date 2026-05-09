@@ -208,6 +208,48 @@ impl AppState {
         self.persist_messages(&topic);
     }
 
+    /// Edit a message by ID (only if sender matches).
+    pub fn edit_message(&mut self, msg_id: &str, new_content: &str, peer_id: &str) {
+        let mut changed_topic: Option<String> = None;
+        for msgs in self.messages.values_mut() {
+            if let Some(msg) = msgs.iter_mut().find(|m| m.id == msg_id && m.sender_peer_id == peer_id) {
+                msg.content = new_content.to_string();
+                msg.edited = true;
+                changed_topic = Some(format!("murmur/server/{}/channel/{}", msg.server_id, msg.channel_id));
+                break;
+            }
+        }
+        if let Some(topic) = changed_topic {
+            self.persist_messages(&topic);
+        }
+    }
+
+    /// Delete a message by ID (only if sender matches).
+    pub fn delete_message(&mut self, msg_id: &str, peer_id: &str) {
+        let mut changed_topic: Option<String> = None;
+        for (topic, msgs) in self.messages.iter_mut() {
+            let before = msgs.len();
+            msgs.retain(|m| !(m.id == msg_id && m.sender_peer_id == peer_id));
+            if msgs.len() != before {
+                changed_topic = Some(topic.clone());
+                break;
+            }
+        }
+        if let Some(topic) = changed_topic {
+            self.persist_messages(&topic);
+        }
+    }
+
+    /// Find a message by ID across all topics.
+    pub fn find_message(&self, msg_id: &str) -> Option<&ChatMessage> {
+        for msgs in self.messages.values() {
+            if let Some(msg) = msgs.iter().find(|m| m.id == msg_id) {
+                return Some(msg);
+            }
+        }
+        None
+    }
+
     /// Clear unread count for a topic (called when switching to that channel).
     pub fn mark_read(&mut self, topic: &str) {
         if let Some(count) = self.unread.remove(topic) {

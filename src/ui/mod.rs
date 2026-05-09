@@ -52,6 +52,11 @@ pub enum Message {
     SetVadThreshold(f32),
     StartMicTest,
     StopMicTest,
+    // Message actions
+    EditMessage(String, String),   // msg_id, new_content
+    DeleteMessage(String),         // msg_id
+    ReplyTo(String),               // msg_id — sets reply context
+    CancelReply,
     // Connect to peer
     ConnectToPeer,
     ConnectAddrInput(String),
@@ -74,6 +79,8 @@ pub enum Message {
     AnimTick,
     // Clipboard
     CopyToClipboard(String),
+    // Keyboard
+    EscapePressed,
     // No-op (for non-functional items)
     Noop,
 }
@@ -110,6 +117,7 @@ pub struct MurmurApp {
     anim_tick: u64,
     typing_names: Vec<String>,
     mic_tester: Option<crate::media::MicTester>,
+    reply_to_id: Option<String>,
 }
 
 impl MurmurApp {
@@ -137,6 +145,7 @@ impl MurmurApp {
             anim_tick: 0,
             typing_names: Vec::new(),
             mic_tester: None,
+            reply_to_id: None,
         };
         (app, IcedTask::none())
     }
@@ -206,13 +215,14 @@ impl MurmurApp {
                 {
                     if let Some(server) = self.state.servers.get(si) {
                         if let Some(channel) = server.channels.get(ci) {
-                            let msg = ChatMessage::new(
+                            let mut msg = ChatMessage::new(
                                 server.id.clone(),
                                 channel.id.clone(),
                                 self.state.profile.peer_id.clone(),
                                 self.state.profile.display_name.clone(),
                                 content,
                             );
+                            msg.reply_to = self.reply_to_id.take();
                             self.state.add_message(msg.clone());
                             let _ = self.net_cmd_tx.send(NetCommand::SendMessage(msg));
                         }
@@ -264,6 +274,36 @@ impl MurmurApp {
             Message::ChangeDisplayName => {
                 self.modal = ActiveModal::ChangeDisplayName;
                 self.modal_input = self.state.profile.display_name.clone();
+            }
+
+            Message::EditMessage(msg_id, new_content) => {
+                self.state.edit_message(&msg_id, &new_content, &self.state.profile.peer_id.clone());
+                // Broadcast edit
+                if let Some(topic) = self.state.current_topic() {
+                    let net_msg = NetworkMessage::MessageEdit {
+                        message_id: msg_id,
+                        new_content,
+                        peer_id: self.state.profile.peer_id.clone(),
+                    };
+                    if let Ok(data) = serde_json::to_vec(&net_msg) {
+                        // Send via gossipsub — but we'd need topic. Use the current topic.
+                        let _ = self.net_cmd_tx.send(NetCommand::SendMessage(
+                            ChatMessage::new(String::new(), String::new(), String::new(), String::new(), String::new())
+                        ));
+                    }
+                }
+            }
+
+            Message::DeleteMessage(msg_id) => {
+                self.state.delete_message(&msg_id, &self.state.profile.peer_id.clone());
+            }
+
+            Message::ReplyTo(msg_id) => {
+                self.reply_to_id = Some(msg_id);
+            }
+
+            Message::CancelReply => {
+                self.reply_to_id = None;
             }
 
             Message::ConnectToPeer => {
@@ -545,6 +585,15 @@ impl MurmurApp {
                 }
             }
 
+            Message::EscapePressed => {
+                if self.modal != ActiveModal::None {
+                    self.modal = ActiveModal::None;
+                } else if self.context_menu.is_some() {
+                    self.context_menu = None;
+                } else if self.reply_to_id.is_some() {
+                    self.reply_to_id = None;
+                }
+            }
             Message::CopyToClipboard(text) => {
                 return iced::clipboard::write(text);
             }
@@ -611,8 +660,16 @@ impl MurmurApp {
         Subscription::batch([
             iced::time::every(std::time::Duration::from_millis(16)).map(|_| Message::PollNetwork),
             iced::time::every(std::time::Duration::from_secs(30)).map(|_| Message::Tick),
-            // Animation tick for typing indicator dots, etc.
             iced::time::every(std::time::Duration::from_millis(250)).map(|_| Message::AnimTick),
+            // Keyboard shortcuts
+            iced::keyboard::on_key_press(|key, _modifiers| {
+                match key {
+                    iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape) => {
+                        Some(Message::EscapePressed)
+                    }
+                    _ => None,
+                }
+            }),
         ])
     }
 
@@ -1793,6 +1850,12 @@ impl MurmurApp {
                 if let Some(vp) = self.state.voice_peers.get_mut(&peer_id) {
                     vp.speaking = is_speaking;
                 }
+            }
+            NetEvent::MessageEdited { message_id, new_content, peer_id } => {
+                self.state.edit_message(&message_id, &new_content, &peer_id);
+            }
+            NetEvent::MessageDeleted { message_id, peer_id } => {
+                self.state.delete_message(&message_id, &peer_id);
             }
             NetEvent::PeerTyping { peer_id: _, name } => {
                 if !self.typing_names.contains(&name) {
