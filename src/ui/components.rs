@@ -174,7 +174,15 @@ pub fn section_header<'a>(label: &str, action: Option<Message>) -> Element<'a, M
 pub fn message_widget<'a>(
     msg: &ChatMessage, is_continuation: bool, _show_hover_actions: bool,
 ) -> Element<'a, Message> {
-    let timestamp = msg.timestamp.format("%H:%M").to_string();
+    let now = chrono::Utc::now();
+    let age = now.signed_duration_since(msg.timestamp);
+    let timestamp = if age.num_days() > 1 {
+        msg.timestamp.format("%m/%d %H:%M").to_string()
+    } else if age.num_days() == 1 {
+        format!("Yesterday {}", msg.timestamp.format("%H:%M"))
+    } else {
+        format!("Today {}", msg.timestamp.format("%H:%M"))
+    };
     let sender = msg.sender_name.clone();
     let content = msg.content.clone();
     let edited = msg.edited;
@@ -224,6 +232,29 @@ pub fn message_widget<'a>(
 
         msg_col = msg_col.push(header_row);
         msg_col = msg_col.push(text(content).size(13).color(C::TEXT_DIM));
+
+        // Show file attachment if present
+        if let Some(ref attachment) = msg.attachment {
+            let size_str = if attachment.file_size > 1_000_000 {
+                format!("{:.1} MB", attachment.file_size as f64 / 1_000_000.0)
+            } else {
+                format!("{:.0} KB", attachment.file_size as f64 / 1_000.0)
+            };
+            msg_col = msg_col.push(
+                container(
+                    row![
+                        text(format!("{} ({})", attachment.file_name, size_str))
+                            .size(12).color(C::TEXT_NORMAL),
+                    ].align_y(iced::Alignment::Center),
+                )
+                .padding(Padding::from([6, 10]))
+                .style(|_t: &iced::Theme| container::Style {
+                    background: Some(C::BG_ELEVATED.into()),
+                    border: iced::Border { width: 1.0, radius: 4.0.into(), color: C::BORDER },
+                    ..Default::default()
+                }),
+            );
+        }
 
         // Show reactions
         if !msg.reactions.is_empty() {

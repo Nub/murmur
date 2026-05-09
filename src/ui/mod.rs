@@ -526,8 +526,8 @@ impl MurmurApp {
             }
 
             // Context menu actions
-            Message::CopyMessageContent(_content) => {
-                // Clipboard integration would go here
+            Message::CopyMessageContent(content) => {
+                return iced::clipboard::write(content);
             }
             Message::DeleteServer(idx) => {
                 if idx < self.state.servers.len() {
@@ -560,7 +560,9 @@ impl MurmurApp {
                     }
                 }
             }
-            Message::CopyPeerId(_peer_id) => {}
+            Message::CopyPeerId(peer_id) => {
+                return iced::clipboard::write(peer_id);
+            }
             Message::MuteChannel(_idx) => {}
 
             Message::PollNetwork => {
@@ -1258,6 +1260,31 @@ impl MurmurApp {
         // ── Typing indicator ──
         main_col = main_col.push(typing_indicator(&self.typing_names, self.anim_tick));
 
+        // ── Reply banner ──
+        if let Some(ref reply_id) = self.reply_to_id {
+            let reply_preview = self.state.find_message(reply_id)
+                .map(|m| format!("Replying to {} — {}", m.sender_name, if m.content.len() > 50 { format!("{}...", &m.content[..50]) } else { m.content.clone() }))
+                .unwrap_or_else(|| "Replying to message".into());
+            main_col = main_col.push(
+                container(
+                    row![
+                        text(reply_preview).size(11).color(C::TEXT_DIM),
+                        horizontal_space(),
+                        button(text("x").size(11).color(C::TEXT_FAINT))
+                            .on_press(Message::CancelReply)
+                            .style(theme::icon_button)
+                            .padding(Padding::from([0, 6])),
+                    ]
+                    .align_y(iced::Alignment::Center),
+                )
+                .padding(pad4(4.0, 20.0, 4.0, 20.0))
+                .style(|_t: &Theme| container::Style {
+                    background: Some(C::BG_ELEVATED.into()),
+                    ..Default::default()
+                }),
+            );
+        }
+
         // ── Input area ──
         let channel_name = if self.state.active_dm_peer.is_some() {
             "Message".to_string()
@@ -1480,29 +1507,48 @@ impl MurmurApp {
             }
             ContextMenuKind::Message(msg_id) => {
                 let mid = msg_id.clone();
-                vec![
+                // Find message content for copy
+                let msg_content = self.state.find_message(&mid)
+                    .map(|m| m.content.clone())
+                    .unwrap_or_default();
+                let is_own = self.state.find_message(&mid)
+                    .map(|m| m.sender_peer_id == self.state.profile.peer_id)
+                    .unwrap_or(false);
+
+                let mut items = vec![
                     ContextMenuItem::Action {
                         label: "Reply".into(),
-                        message: Message::Noop,
+                        message: Message::ReplyTo(mid.clone()),
+                        danger: false,
+                    },
+                    ContextMenuItem::Action {
+                        label: "React +1".into(),
+                        message: Message::ReactToMessage(mid.clone(), "+1".into()),
                         danger: false,
                     },
                     ContextMenuItem::Action {
                         label: "Copy Text".into(),
-                        message: Message::CopyMessageContent(mid.clone()),
-                        danger: false,
-                    },
-                    ContextMenuItem::Action {
-                        label: "Pin Message".into(),
-                        message: Message::Noop,
+                        message: Message::CopyToClipboard(msg_content),
                         danger: false,
                     },
                     ContextMenuItem::Separator,
                     ContextMenuItem::Action {
                         label: "Copy Message ID".into(),
-                        message: Message::Noop,
+                        message: Message::CopyToClipboard(mid.clone()),
                         danger: false,
                     },
-                ]
+                ];
+
+                if is_own {
+                    items.push(ContextMenuItem::Separator);
+                    items.push(ContextMenuItem::Action {
+                        label: "Delete Message".into(),
+                        message: Message::DeleteMessage(mid),
+                        danger: true,
+                    });
+                }
+
+                items
             }
         };
 

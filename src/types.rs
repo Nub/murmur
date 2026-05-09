@@ -146,6 +146,17 @@ pub struct Channel {
     pub name: String,
 }
 
+/// File attachment metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileAttachment {
+    pub file_name: String,
+    pub file_size: u64,
+    pub mime_type: String,
+    /// Whether we have the file data locally
+    #[serde(default)]
+    pub downloaded: bool,
+}
+
 /// A chat message sent over the P2P network.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -165,6 +176,9 @@ pub struct ChatMessage {
     /// Reactions: emoji -> list of peer IDs who reacted
     #[serde(default)]
     pub reactions: std::collections::HashMap<String, Vec<String>>,
+    /// File attachment (if any)
+    #[serde(default)]
+    pub attachment: Option<FileAttachment>,
 }
 
 impl ChatMessage {
@@ -186,6 +200,7 @@ impl ChatMessage {
             reply_to: None,
             edited: false,
             reactions: std::collections::HashMap::new(),
+            attachment: None,
         }
     }
 }
@@ -273,6 +288,14 @@ pub enum NetworkMessage {
     MessageReaction {
         message_id: String,
         emoji: String,
+        peer_id: String,
+    },
+    /// File attachment metadata (actual data sent via request-response)
+    FileShare {
+        message_id: String,
+        file_name: String,
+        file_size: u64,
+        mime_type: String,
         peer_id: String,
     },
 }
