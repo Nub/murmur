@@ -47,20 +47,12 @@
             openssl
             alsa-lib       # ALSA for cpal audio
             libopus        # Opus codec
-            # Dioxus desktop (webview)
-            webkitgtk_4_1
-            gtk3
-            glib
-            gdk-pixbuf
-            cairo
-            pango
-            atk
-            libsoup_3
-            xdotool       # libxdo for Dioxus clipboard
+            libxkbcommon   # screen capture deps
+            xorg.libxcb    # screen capture
+            xorg.libXrandr # screen capture
           ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
             pkgs.darwin.apple_sdk.frameworks.Security
             pkgs.darwin.apple_sdk.frameworks.SystemConfiguration
-            pkgs.darwin.apple_sdk.frameworks.WebKit
           ];
         };
 
@@ -73,14 +65,14 @@
         # Only bundle ABI-stable libs. DO NOT bundle vulkan-loader or libGL
         # — those must come from the system to match the actual GPU driver.
         runtimeLibPath = pkgs.lib.makeLibraryPath (with pkgs; [
-          webkitgtk_4_1
-          gtk3
-          glib
-          gdk-pixbuf
-          cairo
-          pango
-          atk
-          libsoup_3
+          libxkbcommon
+          wayland
+          libglvnd        # provides libEGL/libGL for wgpu GL backend
+          xorg.libX11
+          xorg.libXcursor
+          xorg.libXrandr
+          xorg.libXi
+          xorg.libxcb
           alsa-lib
         ]);
 
@@ -90,7 +82,8 @@
           buildInputs = [ pkgs.makeWrapper ];
           postBuild = ''
             wrapProgram $out/bin/murmur \
-              --prefix LD_LIBRARY_PATH : "${runtimeLibPath}"
+              --prefix LD_LIBRARY_PATH : "${runtimeLibPath}" \
+              --set-default WGPU_BACKEND "gl,vulkan"
           '';
         };
 
@@ -150,15 +143,13 @@
         });
 
         # Zip the Windows build
-        webview2Dll = ./assets/WebView2Loader.dll;
-
         murmurWindowsZip = pkgs.runCommand "murmur-windows-zip" {
           nativeBuildInputs = [ pkgs.zip ];
         } ''
           mkdir -p $out murmur-windows
           cp ${murmurWindows}/bin/murmur.exe murmur-windows/ || true
+          # Copy any DLLs that might be needed
           find ${murmurWindows} -name "*.dll" -exec cp {} murmur-windows/ \; 2>/dev/null || true
-          cp ${webview2Dll} murmur-windows/WebView2Loader.dll
           cd murmur-windows/..
           zip -r $out/murmur-windows.zip murmur-windows/
         '';
