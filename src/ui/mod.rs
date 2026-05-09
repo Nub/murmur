@@ -1707,18 +1707,12 @@ impl MurmurApp {
                 self.state.add_direct_message(msg);
             }
             NetEvent::PeerDiscovered { peer_id, name } => {
-                self.state
-                    .peers
-                    .entry(peer_id.to_string())
-                    .or_insert(UserProfile {
-                        peer_id: peer_id.to_string(),
-                        display_name: name,
-                        status: UserStatus::Online,
-                    });
+                self.state.update_peer(peer_id.to_string(), name, UserStatus::Online);
             }
             NetEvent::PeerLeft(peer_id) => {
                 if let Some(profile) = self.state.peers.get_mut(&peer_id.to_string()) {
                     profile.status = UserStatus::Offline;
+                    self.state.persist_peers();
                 }
             }
             NetEvent::PresenceUpdate {
@@ -1726,31 +1720,14 @@ impl MurmurApp {
                 name,
                 status,
             } => {
-                let profile =
-                    self.state
-                        .peers
-                        .entry(peer_id.clone())
-                        .or_insert(UserProfile {
-                            peer_id: peer_id.clone(),
-                            display_name: name.clone(),
-                            status,
-                        });
-                profile.display_name = name;
-                profile.status = status;
+                self.state.update_peer(peer_id, name, status);
             }
             NetEvent::ServerJoined {
                 peer_id,
                 name,
                 server_id: _,
             } => {
-                self.state
-                    .peers
-                    .entry(peer_id.clone())
-                    .or_insert(UserProfile {
-                        peer_id,
-                        display_name: name,
-                        status: UserStatus::Online,
-                    });
+                self.state.update_peer(peer_id, name, UserStatus::Online);
             }
             NetEvent::ChannelCreated {
                 server_id,

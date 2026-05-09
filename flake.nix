@@ -58,9 +58,29 @@
 
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
-        murmur = craneLib.buildPackage (commonArgs // {
+        murmurUnwrapped = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
         });
+
+        # Wrap the binary with runtime library paths for non-NixOS Linux
+        murmur = pkgs.runCommand "murmur-wrapped" {
+          nativeBuildInputs = [ pkgs.makeWrapper ];
+        } ''
+          mkdir -p $out/bin
+          makeWrapper ${murmurUnwrapped}/bin/murmur $out/bin/murmur \
+            --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath (with pkgs; [
+              vulkan-loader
+              libxkbcommon
+              wayland
+              libGL
+              xorg.libX11
+              xorg.libXcursor
+              xorg.libXrandr
+              xorg.libXi
+              xorg.libxcb
+              alsa-lib
+            ])}
+        '';
 
         # Cross-compilation for Windows using mingw from nixpkgs
         pkgsCrossWin = pkgs.pkgsCross.mingwW64;
@@ -138,7 +158,7 @@
         };
 
         devShells.default = craneLib.devShell {
-          inputsFrom = [ murmur ];
+          inputsFrom = [ murmurUnwrapped ];
           packages = with pkgs; [
             rustToolchain
             cargo-watch

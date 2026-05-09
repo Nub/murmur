@@ -113,6 +113,17 @@ impl AppState {
             display_name
         };
 
+        // Load cached peer profiles
+        let mut peers: HashMap<String, UserProfile> = HashMap::new();
+        if let Ok(Some(data)) = db.get("peers") {
+            if let Ok(cached) = bincode::deserialize::<Vec<UserProfile>>(&data) {
+                for mut p in cached {
+                    p.status = UserStatus::Offline; // All cached peers start offline
+                    peers.insert(p.peer_id.clone(), p);
+                }
+            }
+        }
+
         Ok(Self {
             db,
             profile: UserProfile {
@@ -123,7 +134,7 @@ impl AppState {
             servers,
             messages: HashMap::new(),
             direct_messages: HashMap::new(),
-            peers: HashMap::new(),
+            peers,
             active_server: Some(0),
             active_channel: Some(0),
             active_dm_peer: None,
@@ -224,6 +235,25 @@ impl AppState {
             if let Ok(msgs) = bincode::deserialize::<Vec<ChatMessage>>(&data) {
                 self.messages.insert(topic.to_string(), msgs);
             }
+        }
+    }
+
+    /// Update a peer's profile and persist to disk.
+    pub fn update_peer(&mut self, peer_id: String, name: String, status: UserStatus) {
+        let profile = self.peers.entry(peer_id.clone()).or_insert(UserProfile {
+            peer_id: peer_id.clone(),
+            display_name: name.clone(),
+            status,
+        });
+        profile.display_name = name;
+        profile.status = status;
+        self.persist_peers();
+    }
+
+    pub fn persist_peers(&self) {
+        let profiles: Vec<UserProfile> = self.peers.values().cloned().collect();
+        if let Ok(data) = bincode::serialize(&profiles) {
+            let _ = self.db.insert("peers", data);
         }
     }
 
