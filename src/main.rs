@@ -10,13 +10,11 @@ mod types;
 mod ui;
 
 use anyhow::Result;
-use iced::Theme;
 use network::{NetCommand, NetworkManager};
 use state::AppState;
 use tokio::sync::mpsc;
 use tracing::info;
 use types::NetEvent;
-use ui::MurmurApp;
 
 /// Default bootstrap nodes for internet-wide peer discovery.
 /// These are well-known IPFS/libp2p bootstrap nodes that help with Kademlia DHT.
@@ -171,16 +169,23 @@ fn run() -> Result<()> {
         populate_test_data(&mut state);
     }
 
-    // Run the iced GUI
-    iced::application(
-        MurmurApp::title,
-        MurmurApp::update,
-        MurmurApp::view,
-    )
-    .subscription(MurmurApp::subscription)
-    .theme(|_app| Theme::Dark)
-    .window_size((1200.0, 800.0))
-    .run_with(move || MurmurApp::new(state, net_cmd_tx, net_event_rx, test_scene))?;
+    // Run the egui GUI
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1200.0, 800.0])
+            .with_title("murmur"),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "murmur",
+        options,
+        Box::new(move |cc| {
+            // Dark theme
+            cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            Ok(Box::new(ui::MurmurApp::new(state, net_cmd_tx, net_event_rx)))
+        }),
+    ).map_err(|e| anyhow::anyhow!("GUI error: {}", e))?;
 
     Ok(())
 }

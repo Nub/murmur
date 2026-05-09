@@ -29,8 +29,9 @@ libp2p = { version = "0.54", features = [
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 
-# Native GUI (GPU-accelerated via wgpu, no browser tech)
-iced = { version = "0.13", features = ["tokio", "advanced", "image"] }
+# Native GUI — egui (pure native rendering via wgpu/glow, no webview)
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "persistence", "x11", "wayland"] }
+egui = "0.31"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

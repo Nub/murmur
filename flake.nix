@@ -47,9 +47,15 @@
             openssl
             alsa-lib       # ALSA for cpal audio
             libopus        # Opus codec
-            libxkbcommon   # screen capture deps
-            xorg.libxcb    # screen capture
-            xorg.libXrandr # screen capture
+            # egui/winit windowing
+            libxkbcommon
+            xorg.libX11
+            xorg.libXcursor
+            xorg.libXrandr
+            xorg.libXi
+            xorg.libxcb
+            wayland
+            libGL
           ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
             pkgs.darwin.apple_sdk.frameworks.Security
             pkgs.darwin.apple_sdk.frameworks.SystemConfiguration
@@ -67,7 +73,7 @@
         runtimeLibPath = pkgs.lib.makeLibraryPath (with pkgs; [
           libxkbcommon
           wayland
-          libglvnd        # provides libEGL/libGL for wgpu GL backend
+          libGL
           xorg.libX11
           xorg.libXcursor
           xorg.libXrandr

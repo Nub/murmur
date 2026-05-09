@@ -1,105 +1,31 @@
 mod components;
 mod theme;
 
-use self::components::{pad4, *};
-use self::theme::C;
 use crate::network::NetCommand;
 use crate::state::AppState;
 use crate::types::*;
-use iced::widget::{
-    button, column, container, horizontal_rule, horizontal_space, row, scrollable, text,
-    text_input, tooltip, Column, Row, Space,
-};
-use iced::{Color, Element, Length, Padding, Subscription, Task as IcedTask, Theme};
+use egui::{self, Color32, RichText, Vec2};
+use theme::*;
 use tokio::sync::mpsc;
 
-// ── Messages ────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone)]
-pub enum Message {
-    // Input
-    InputChanged(String),
-    SendMessage,
-    // Navigation
-    SelectServer(usize),
-    SelectChannel(usize),
-    SelectDM(String),
-    // Server management
-    CreateServer,
-    JoinServer,
-    CreateChannel,
-    ServerNameInput(String),
-    ChannelNameInput(String),
-    // Voice & screen
-    ToggleVoice,
-    ToggleMute,
-    ToggleDeafen,
-    ToggleScreenShare,
-    // Network events
-    NetEvent(NetEvent),
-    // Presence
-    SetStatus(UserStatus),
-    // Settings
-    ChangeDisplayName,
-    DisplayNameInput(String),
-    OpenSettings,
-    // Audio settings
-    SetInputDevice(String),
-    SetOutputDevice(String),
-    SetInputVolume(f32),
-    SetOutputVolume(f32),
-    ToggleNoiseSuppression,
-    SetVadThreshold(f32),
-    StartMicTest,
-    StopMicTest,
-    // Message actions
-    EditMessage(String, String),   // msg_id, new_content
-    DeleteMessage(String),         // msg_id
-    ReplyTo(String),               // msg_id — sets reply context
-    CancelReply,
-    ReactToMessage(String, String), // msg_id, emoji
-    // Connect to peer
-    ConnectToPeer,
-    ConnectAddrInput(String),
-    // Modal
-    CloseModal,
-    ConfirmModal,
-    // Context menu
-    OpenContextMenu(ContextMenuKind),
-    CloseContextMenu,
-    // Context menu actions
-    CopyMessageContent(String),
-    DeleteServer(usize),
-    LeaveServer(usize),
-    CopyPeerId(String),
-    MuteChannel(usize),
-    // Poll network events
-    PollNetwork,
-    // Tick (for periodic tasks and animations)
-    Tick,
-    AnimTick,
-    // Clipboard
-    CopyToClipboard(String),
-    // Search
-    OpenSearch,
-    SearchInput(String),
-    CloseSearch,
-    // Keyboard
-    EscapePressed,
-    // No-op (for non-functional items)
-    Noop,
+pub struct MurmurApp {
+    state: AppState,
+    cmd_tx: mpsc::UnboundedSender<NetCommand>,
+    event_rx: Option<mpsc::UnboundedReceiver<NetEvent>>,
+    modal: Modal,
+    modal_input: String,
+    connected: bool,
+    anim_tick: u64,
+    typing_names: Vec<String>,
+    mic_tester: Option<crate::media::MicTester>,
+    reply_to_id: Option<String>,
+    search_query: String,
+    search_results: Vec<ChatMessage>,
+    search_open: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum ContextMenuKind {
-    Server(usize),
-    Channel(usize),
-    Member(String),
-    Message(String), // message id
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum ActiveModal {
+#[derive(PartialEq)]
+enum Modal {
     None,
     CreateServer,
     JoinServer,
@@ -109,47 +35,19 @@ pub enum ActiveModal {
     ConnectPeer,
 }
 
-// ── App state ───────────────────────────────────────────────────────────────
-
-pub struct MurmurApp {
-    state: AppState,
-    net_cmd_tx: mpsc::UnboundedSender<NetCommand>,
-    net_event_rx: Option<mpsc::UnboundedReceiver<NetEvent>>,
-    modal: ActiveModal,
-    modal_input: String,
-    connected: bool,
-    context_menu: Option<ContextMenuKind>,
-    anim_tick: u64,
-    typing_names: Vec<String>,
-    mic_tester: Option<crate::media::MicTester>,
-    reply_to_id: Option<String>,
-    search_query: String,
-    search_results: Vec<crate::types::ChatMessage>,
-    search_open: bool,
-}
-
 impl MurmurApp {
     pub fn new(
         state: AppState,
-        net_cmd_tx: mpsc::UnboundedSender<NetCommand>,
-        net_event_rx: mpsc::UnboundedReceiver<NetEvent>,
-        test_scene: Option<String>,
-    ) -> (Self, IcedTask<Message>) {
-        // Determine initial modal based on test scene
-        let modal = match test_scene.as_deref() {
-            Some("settings") => ActiveModal::Settings,
-            Some("create-server") => ActiveModal::CreateServer,
-            _ => ActiveModal::None,
-        };
-
-        let app = Self {
+        cmd_tx: mpsc::UnboundedSender<NetCommand>,
+        event_rx: mpsc::UnboundedReceiver<NetEvent>,
+    ) -> Self {
+        Self {
             state,
-            net_cmd_tx,
-            net_event_rx: Some(net_event_rx),
-            modal,
+            cmd_tx,
+            event_rx: Some(event_rx),
+            modal: Modal::None,
             modal_input: String::new(),
-            connected: test_scene.is_some(), // Show as connected in test mode
-            context_menu: None,
+            connected: false,
             anim_tick: 0,
             typing_names: Vec::new(),
             mic_tester: None,
@@ -157,1881 +55,71 @@ impl MurmurApp {
             search_query: String::new(),
             search_results: Vec::new(),
             search_open: false,
-        };
-        (app, IcedTask::none())
+        }
     }
 
-    pub fn title(&self) -> String {
-        let peer_short = if self.state.profile.peer_id.len() >= 8 {
-            &self.state.profile.peer_id[..8]
+    fn poll_events(&mut self) {
+        let events: Vec<NetEvent> = if let Some(ref mut rx) = self.event_rx {
+            let mut evts = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                evts.push(event);
+            }
+            evts
         } else {
-            &self.state.profile.peer_id
+            Vec::new()
         };
-        if self.state.total_unread > 0 {
-            format!("murmur ({}) - {} [{}]", self.state.total_unread, self.state.profile.display_name, peer_short)
-        } else {
-            format!("murmur - {} [{}]", self.state.profile.display_name, peer_short)
+        for event in events {
+            self.handle_event(event);
         }
     }
 
-    // ── Update ──────────────────────────────────────────────────────────
-
-    pub fn update(&mut self, message: Message) -> IcedTask<Message> {
-        // Close context menu on any click that isn't opening one
-        match &message {
-            Message::OpenContextMenu(_) | Message::CloseContextMenu => {}
-            _ => {
-                if self.context_menu.is_some() {
-                    self.context_menu = None;
-                }
-            }
-        }
-
-        match message {
-            Message::InputChanged(val) => {
-                self.state.input_buffer = val;
-                // Send typing indicator (debounced by anim tick)
-                if !self.state.input_buffer.is_empty() {
-                    if let Some(topic) = self.state.current_topic() {
-                        let _ = self.net_cmd_tx.send(NetCommand::SendTyping {
-                            topic,
-                            name: self.state.profile.display_name.clone(),
-                        });
-                    }
-                }
-            }
-
-            Message::SendMessage => {
-                let content = self.state.input_buffer.trim().to_string();
-                if content.is_empty() {
-                    return IcedTask::none();
-                }
-                if content.starts_with('/') {
-                    return self.handle_command(&content);
-                }
-
-                if let Some(ref peer_id) = self.state.active_dm_peer.clone() {
-                    let dm = DirectMessage {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        from_peer_id: self.state.profile.peer_id.clone(),
-                        from_name: self.state.profile.display_name.clone(),
-                        to_peer_id: peer_id.clone(),
-                        content,
-                        timestamp: chrono::Utc::now(),
-                    };
-                    self.state.add_direct_message(dm.clone());
-                    let _ = self.net_cmd_tx.send(NetCommand::SendDirectMessage(dm));
-                } else if let (Some(si), Some(ci)) =
-                    (self.state.active_server, self.state.active_channel)
-                {
-                    if let Some(server) = self.state.servers.get(si) {
-                        if let Some(channel) = server.channels.get(ci) {
-                            let mut msg = ChatMessage::new(
-                                server.id.clone(),
-                                channel.id.clone(),
-                                self.state.profile.peer_id.clone(),
-                                self.state.profile.display_name.clone(),
-                                content,
-                            );
-                            msg.reply_to = self.reply_to_id.take();
-                            self.state.add_message(msg.clone());
-                            let _ = self.net_cmd_tx.send(NetCommand::SendMessage(msg));
-                        }
-                    }
-                }
-                self.state.input_buffer.clear();
-            }
-
-            Message::SelectServer(idx) => {
-                self.state.active_server = Some(idx);
-                self.state.active_channel = Some(0);
-                self.state.active_dm_peer = None;
-                if let Some(topic) = self.state.current_topic() {
-                    self.state.load_messages_for_topic(&topic);
-                    self.state.mark_read(&topic);
-                }
-                self.subscribe_to_current_channel();
-            }
-
-            Message::SelectChannel(idx) => {
-                self.state.active_channel = Some(idx);
-                self.state.active_dm_peer = None;
-                if let Some(topic) = self.state.current_topic() {
-                    self.state.load_messages_for_topic(&topic);
-                    self.state.mark_read(&topic);
-                }
-                self.subscribe_to_current_channel();
-            }
-
-            Message::SelectDM(peer_id) => {
-                self.state.active_dm_peer = Some(peer_id);
-            }
-
-            Message::CreateServer => {
-                self.modal = ActiveModal::CreateServer;
-                self.modal_input.clear();
-            }
-
-            Message::JoinServer => {
-                self.modal = ActiveModal::JoinServer;
-                self.modal_input.clear();
-            }
-
-            Message::CreateChannel => {
-                self.modal = ActiveModal::CreateChannel;
-                self.modal_input.clear();
-            }
-
-            Message::ChangeDisplayName => {
-                self.modal = ActiveModal::ChangeDisplayName;
-                self.modal_input = self.state.profile.display_name.clone();
-            }
-
-            Message::EditMessage(msg_id, new_content) => {
-                self.state.edit_message(&msg_id, &new_content, &self.state.profile.peer_id.clone());
-                // Broadcast edit
-                if let Some(topic) = self.state.current_topic() {
-                    let net_msg = NetworkMessage::MessageEdit {
-                        message_id: msg_id,
-                        new_content,
-                        peer_id: self.state.profile.peer_id.clone(),
-                    };
-                    if let Ok(data) = serde_json::to_vec(&net_msg) {
-                        // Send via gossipsub — but we'd need topic. Use the current topic.
-                        let _ = self.net_cmd_tx.send(NetCommand::SendMessage(
-                            ChatMessage::new(String::new(), String::new(), String::new(), String::new(), String::new())
-                        ));
-                    }
-                }
-            }
-
-            Message::DeleteMessage(msg_id) => {
-                self.state.delete_message(&msg_id, &self.state.profile.peer_id.clone());
-            }
-
-            Message::ReplyTo(msg_id) => {
-                self.reply_to_id = Some(msg_id);
-            }
-
-            Message::CancelReply => {
-                self.reply_to_id = None;
-            }
-
-            Message::ReactToMessage(msg_id, emoji) => {
-                self.state.toggle_reaction(&msg_id, &emoji, &self.state.profile.peer_id.clone());
-            }
-
-            Message::ConnectToPeer => {
-                self.modal = ActiveModal::ConnectPeer;
-                self.modal_input.clear();
-            }
-            Message::ConnectAddrInput(val) => {
-                self.modal_input = val;
-            }
-
-            Message::OpenSettings => {
-                // Enumerate audio devices
-                self.state.audio.available_inputs = crate::media::list_input_devices();
-                self.state.audio.available_outputs = crate::media::list_output_devices();
-                self.modal = ActiveModal::Settings;
-            }
-
-            Message::SetInputDevice(name) => {
-                self.state.audio.input_device = if name == "Default" { None } else { Some(name) };
-                self.state.save_audio_settings();
-            }
-            Message::SetOutputDevice(name) => {
-                self.state.audio.output_device = if name == "Default" { None } else { Some(name) };
-                self.state.save_audio_settings();
-            }
-            Message::SetInputVolume(v) => {
-                self.state.audio.input_volume = v;
-                self.state.save_audio_settings();
-            }
-            Message::SetOutputVolume(v) => {
-                self.state.audio.output_volume = v;
-                self.state.save_audio_settings();
-            }
-            Message::ToggleNoiseSuppression => {
-                self.state.audio.noise_suppression = !self.state.audio.noise_suppression;
-                self.state.save_audio_settings();
-            }
-            Message::SetVadThreshold(v) => {
-                self.state.audio.vad_threshold = v;
-                self.state.save_audio_settings();
-            }
-            Message::StartMicTest => {
-                match crate::media::MicTester::start(
-                    &self.state.audio.input_device,
-                    self.state.audio.input_volume,
-                ) {
-                    Ok(tester) => {
-                        self.mic_tester = Some(tester);
-                        self.state.audio.mic_testing = true;
-                    }
-                    Err(e) => {
-                        tracing::error!("Mic test failed: {}", e);
-                    }
-                }
-            }
-            Message::StopMicTest => {
-                if let Some(mut tester) = self.mic_tester.take() {
-                    tester.stop();
-                }
-                self.state.audio.mic_testing = false;
-                self.state.audio.mic_level = 0.0;
-            }
-
-            Message::ServerNameInput(val)
-            | Message::ChannelNameInput(val)
-            | Message::DisplayNameInput(val) => {
-                self.modal_input = val;
-            }
-
-            Message::ConfirmModal => {
-                let input = self.modal_input.trim().to_string();
-                if input.is_empty() {
-                    self.modal = ActiveModal::None;
-                    return IcedTask::none();
-                }
-                match self.modal {
-                    ActiveModal::CreateServer => {
-                        let server = Server::new_owned(input, self.state.profile.peer_id.clone());
-                        let topic = server.topic_for_channel("general");
-                        self.state.add_server(server);
-                        let _ = self.net_cmd_tx.send(NetCommand::JoinServer(topic));
-                    }
-                    ActiveModal::JoinServer => {
-                        // Try to parse as invite code first, fall back to server name
-                        if let Some((name, addrs)) = Server::parse_invite(&input) {
-                            let mut server = Server::new(name);
-                            // Connect to all peers from the invite
-                            for addr_str in &addrs {
-                                if let Ok(addr) = addr_str.parse() {
-                                    let _ = self.net_cmd_tx.send(NetCommand::Dial(addr));
-                                }
-                                server.add_peer("unknown", vec![addr_str.clone()]);
-                            }
-                            let topic = server.topic_for_channel("general");
-                            self.state.add_server(server);
-                            let _ = self.net_cmd_tx.send(NetCommand::JoinServer(topic));
-                        } else {
-                            let server = Server::new(input);
-                            let topic = server.topic_for_channel("general");
-                            self.state.add_server(server);
-                            let _ = self.net_cmd_tx.send(NetCommand::JoinServer(topic));
-                        }
-                    }
-                    ActiveModal::CreateChannel => {
-                        if let Some(si) = self.state.active_server {
-                            if let Some(server) = self.state.servers.get(si) {
-                                let channel = Channel {
-                                    id: input.to_lowercase().replace(' ', "-"),
-                                    name: input.clone(),
-                                };
-                                let server_id = server.id.clone();
-                                self.state
-                                    .add_channel_to_server(&server_id, channel.clone());
-                                let _ = self.net_cmd_tx.send(NetCommand::CreateChannel {
-                                    server_id,
-                                    channel,
-                                });
-                            }
-                        }
-                    }
-                    ActiveModal::ChangeDisplayName => {
-                        self.state.set_display_name(input);
-                        let _ = self.net_cmd_tx.send(NetCommand::UpdatePresence(
-                            self.state.profile.status,
-                        ));
-                    }
-                    ActiveModal::ConnectPeer => {
-                        match input.parse::<libp2p::Multiaddr>() {
-                            Ok(addr) => {
-                                tracing::info!("Connecting to: {}", addr);
-                                let _ = self.net_cmd_tx.send(NetCommand::Dial(addr));
-                            }
-                            Err(e) => {
-                                tracing::error!("Invalid address '{}': {}", input, e);
-                            }
-                        }
-                    }
-                    ActiveModal::None | ActiveModal::Settings => {}
-                }
-                self.modal = ActiveModal::None;
-            }
-
-            Message::CloseModal => {
-                self.modal = ActiveModal::None;
-            }
-
-            Message::ToggleVoice => {
-                self.state.voice_active = !self.state.voice_active;
-                if self.state.voice_active {
-                    // Set voice channel name
-                    if let (Some(si), Some(ci)) = (self.state.active_server, self.state.active_channel) {
-                        if let Some(server) = self.state.servers.get(si) {
-                            if let Some(channel) = server.channels.get(ci) {
-                                self.state.voice_channel_name = Some(channel.name.clone());
-                            }
-                        }
-                    }
-                    if let Some(topic) = self.state.current_topic() {
-                        let _ = self.net_cmd_tx.send(NetCommand::StartVoice(topic));
-                    }
-                } else {
-                    let _ = self.net_cmd_tx.send(NetCommand::StopVoice);
-                    self.state.screen_sharing = false;
-                    self.state.voice_muted = false;
-                    self.state.voice_deafened = false;
-                    self.state.voice_peers.clear();
-                    self.state.voice_channel_name = None;
-                }
-            }
-
-            Message::ToggleMute => {
-                self.state.voice_muted = !self.state.voice_muted;
-            }
-
-            Message::ToggleDeafen => {
-                self.state.voice_deafened = !self.state.voice_deafened;
-                // Deafening also mutes
-                if self.state.voice_deafened {
-                    self.state.voice_muted = true;
-                }
-            }
-
-            Message::ToggleScreenShare => {
-                self.state.screen_sharing = !self.state.screen_sharing;
-                if self.state.screen_sharing {
-                    if let Some(topic) = self.state.current_topic() {
-                        let _ = self.net_cmd_tx.send(NetCommand::StartScreenShare(topic));
-                    }
-                } else {
-                    let _ = self.net_cmd_tx.send(NetCommand::StopScreenShare);
-                }
-            }
-
-            Message::SetStatus(status) => {
-                self.state.profile.status = status;
-                let _ = self.net_cmd_tx.send(NetCommand::UpdatePresence(status));
-            }
-
-            Message::OpenContextMenu(kind) => {
-                self.context_menu = Some(kind);
-            }
-
-            Message::CloseContextMenu => {
-                self.context_menu = None;
-            }
-
-            // Context menu actions
-            Message::CopyMessageContent(content) => {
-                return iced::clipboard::write(content);
-            }
-            Message::DeleteServer(idx) => {
-                if idx < self.state.servers.len() {
-                    self.state.servers.remove(idx);
-                    if self.state.active_server == Some(idx) {
-                        self.state.active_server = if self.state.servers.is_empty() {
-                            None
-                        } else {
-                            Some(0)
-                        };
-                        self.state.active_channel = Some(0);
-                    }
-                }
-            }
-            Message::LeaveServer(idx) => {
-                if let Some(server) = self.state.servers.get(idx) {
-                    for channel in &server.channels {
-                        let topic = server.topic_for_channel(&channel.id);
-                        let _ = self.net_cmd_tx.send(NetCommand::LeaveServer(topic));
-                    }
-                }
-                if idx < self.state.servers.len() {
-                    self.state.servers.remove(idx);
-                    if self.state.active_server == Some(idx) {
-                        self.state.active_server = if self.state.servers.is_empty() {
-                            None
-                        } else {
-                            Some(0)
-                        };
-                    }
-                }
-            }
-            Message::CopyPeerId(peer_id) => {
-                return iced::clipboard::write(peer_id);
-            }
-            Message::MuteChannel(_idx) => {}
-
-            Message::PollNetwork => {
-                let events: Vec<NetEvent> = if let Some(ref mut rx) = self.net_event_rx {
-                    let mut evts = Vec::new();
-                    while let Ok(event) = rx.try_recv() {
-                        evts.push(event);
-                    }
-                    evts
-                } else {
-                    Vec::new()
-                };
-                for event in events {
-                    self.handle_net_event(event);
-                }
-            }
-
-            Message::NetEvent(event) => {
-                self.handle_net_event(event);
-            }
-
-            Message::Tick => {
-                let _ = self
-                    .net_cmd_tx
-                    .send(NetCommand::UpdatePresence(self.state.profile.status));
-            }
-
-            Message::AnimTick => {
-                self.anim_tick = self.anim_tick.wrapping_add(1);
-                // Update mic test level
-                if let Some(ref tester) = self.mic_tester {
-                    self.state.audio.mic_level = tester.level();
-                }
-                // Clear typing indicators every ~3 seconds (12 ticks * 250ms)
-                if self.anim_tick % 12 == 0 {
-                    self.typing_names.clear();
-                }
-            }
-
-            Message::OpenSearch => {
-                self.search_open = true;
-                self.search_query.clear();
-                self.search_results.clear();
-            }
-            Message::SearchInput(query) => {
-                self.search_query = query.clone();
-                if query.len() >= 2 {
-                    self.search_results = self.state.search_messages(&query);
-                } else {
-                    self.search_results.clear();
-                }
-            }
-            Message::CloseSearch => {
-                self.search_open = false;
-                self.search_query.clear();
-                self.search_results.clear();
-            }
-            Message::EscapePressed => {
-                if self.modal != ActiveModal::None {
-                    self.modal = ActiveModal::None;
-                } else if self.search_open {
-                    self.search_open = false;
-                } else if self.context_menu.is_some() {
-                    self.context_menu = None;
-                } else if self.reply_to_id.is_some() {
-                    self.reply_to_id = None;
-                }
-            }
-            Message::CopyToClipboard(text) => {
-                return iced::clipboard::write(text);
-            }
-            Message::Noop => {}
-        }
-        IcedTask::none()
-    }
-
-    // ── View ────────────────────────────────────────────────────────────
-
-    pub fn view(&self) -> Element<Message> {
-        // New layout: column![topbar, row![sidebar, main, members]]
-        let right_panel: Element<Message> = if self.search_open {
-            self.view_search_panel()
-        } else {
-            self.view_member_sidebar()
-        };
-
-        let content = column![
-            self.view_topbar(),
-            row![
-                self.view_channel_sidebar(),
-                self.view_main_area(),
-                right_panel,
-            ].height(Length::Fill),
-        ];
-
-        let mut layers: Vec<Element<Message>> = vec![content.into()];
-
-        // Context menu overlay
-        if let Some(ref ctx) = self.context_menu {
-            layers.push(
-                // Clickable backdrop to close
-                iced::widget::mouse_area(
-                    container(self.view_context_menu(ctx))
-                        .width(Length::Fill)
-                        .height(Length::Fill)
-                        .padding(pad4(100.0, 0.0, 0.0, 300.0)),
-                )
-                .on_press(Message::CloseContextMenu)
-                .into(),
-            );
-        }
-
-        // Modal overlay
-        if self.modal != ActiveModal::None {
-            layers.push(
-                container(self.view_modal())
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .center_x(Length::Fill)
-                    .center_y(Length::Fill)
-                    .style(theme::modal_backdrop)
-                    .into(),
-            );
-        }
-
-        if layers.len() == 1 {
-            layers.into_iter().next().unwrap()
-        } else {
-            let mut stack = iced::widget::Stack::new();
-            for layer in layers {
-                stack = stack.push(layer);
-            }
-            stack.into()
-        }
-    }
-
-    pub fn subscription(&self) -> Subscription<Message> {
-        Subscription::batch([
-            iced::time::every(std::time::Duration::from_millis(16)).map(|_| Message::PollNetwork),
-            iced::time::every(std::time::Duration::from_secs(30)).map(|_| Message::Tick),
-            iced::time::every(std::time::Duration::from_millis(250)).map(|_| Message::AnimTick),
-            // Keyboard shortcuts
-            iced::keyboard::on_key_press(|key, modifiers| {
-                match key {
-                    iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape) => {
-                        Some(Message::EscapePressed)
-                    }
-                    iced::keyboard::Key::Character(ref c) if c.as_str() == "k" && modifiers.command() => {
-                        Some(Message::OpenSearch)
-                    }
-                    _ => None,
-                }
-            }),
-        ])
-    }
-
-    // ── Top bar (horizontal server strip + identity) ──────────────────
-
-    fn view_topbar(&self) -> Element<Message> {
-        let mut bar = Row::new().spacing(6).align_y(iced::Alignment::Center);
-
-        // Home button
-        bar = bar.push(
-            button(
-                container(text("dc").size(13).color(C::GREEN))
-                    .width(36).height(36).center_x(36).center_y(36),
-            )
-            .on_press(Message::Noop)
-            .style(theme::server_icon_active),
-        );
-
-        // Separator
-        bar = bar.push(
-            container(Space::new(1, 24))
-                .style(|_t: &Theme| container::Style {
-                    background: Some(C::BORDER.into()), ..Default::default()
-                }),
-        );
-
-        // Server icons
-        for (i, server) in self.state.servers.iter().enumerate() {
-            let is_active = self.state.active_server == Some(i);
-            bar = bar.push(server_icon_widget(&server.name, i, is_active, false));
-        }
-
-        // Separator + Add
-        bar = bar.push(
-            container(Space::new(1, 24))
-                .style(|_t: &Theme| container::Style {
-                    background: Some(C::BORDER.into()), ..Default::default()
-                }),
-        );
-        bar = bar.push(
-            button(
-                container(text("+").size(18).color(C::TEXT_FAINT))
-                    .width(36).height(36).center_x(36).center_y(36),
-            )
-            .on_press(Message::CreateServer)
-            .style(theme::add_server_icon),
-        );
-
-        // Connect to peer button
-        bar = bar.push(
-            tooltip(
-                button(text("->").size(11).color(C::TEXT_FAINT))
-                    .on_press(Message::ConnectToPeer)
-                    .style(theme::icon_button)
-                    .padding(Padding::from([8, 10])),
-                container(text("Connect to Peer").size(11).color(C::TEXT_DIM))
-                    .padding(Padding::from([4, 8]))
-                    .style(theme::tooltip_box),
-                tooltip::Position::Bottom,
-            )
-            .gap(6),
-        );
-
-        // Spacer + identity on right
-        bar = bar.push(horizontal_space());
-
-        // Connection dot + avatar + name
-        bar = bar.push(
-            container(Space::new(6, 6))
-                .style(|_t: &Theme| container::Style {
-                    background: Some(C::GREEN.into()),
-                    border: iced::Border { radius: 3.0.into(), ..Default::default() },
-                    ..Default::default()
-                }),
-        );
-        bar = bar.push(Space::with_width(4));
-
-        let my_name = self.state.profile.display_name.clone();
-        bar = bar.push(
-            button(
-                row![
-                    avatar(&my_name, 28.0, None),
-                    Space::with_width(6),
-                    text(my_name).size(12).color(C::TEXT_DIM),
-                ].align_y(iced::Alignment::Center),
-            )
-            .on_press(Message::ChangeDisplayName)
-            .style(theme::icon_button)
-            .padding(Padding::from([4, 8])),
-        );
-
-        // Settings gear
-        bar = bar.push(
-            button(text("*").size(14).color(C::TEXT_FAINT))
-                .on_press(Message::OpenSettings)
-                .style(theme::icon_button)
-                .padding(Padding::from([6, 8])),
-        );
-
-        container(bar)
-            .padding(Padding::from([6, 12]))
-            .width(Length::Fill)
-            .style(theme::topbar)
-            .into()
-    }
-
-    // ── Channel sidebar ─────────────────────────────────────────────────
-
-    fn view_channel_sidebar(&self) -> Element<Message> {
-        let mut sidebar = Column::new().width(240);
-
-        if let Some(si) = self.state.active_server {
-            if let Some(server) = self.state.servers.get(si) {
-                // Server name header (Discord-style, 48px tall with bottom shadow)
-                sidebar = sidebar.push(
-                    container(
-                        text(server.name.clone())
-                            .size(15)
-                            .color(C::TEXT_BRIGHT),
-                    )
-                    .padding(Padding::from([13, 16]))
-                    .width(Length::Fill)
-                    .style(theme::server_name_header),
-                );
-
-                // Text channels section
-                sidebar = sidebar.push(Space::with_height(2));
-                sidebar =
-                    sidebar.push(section_header("TEXT CHANNELS", Some(Message::CreateChannel)));
-
-                for (i, channel) in server.channels.iter().enumerate() {
-                    let is_active = self.state.active_channel == Some(i)
-                        && self.state.active_dm_peer.is_none();
-                    let topic = server.topic_for_channel(&channel.id);
-                    let unread = self.state.unread.get(&topic).copied().unwrap_or(0);
-                    sidebar = sidebar.push(
-                        container(channel_item(&channel.name, i, is_active, unread))
-                            .padding(pad4(0.0, 8.0, 0.0, 8.0)),
-                    );
-                }
-
-                // Voice channels section
-                sidebar = sidebar.push(Space::with_height(8));
-                sidebar = sidebar.push(section_header("VOICE CHANNELS", None));
-
-                // Voice channel item (Discord-style: channel name, users listed below when connected)
-                let vc_name_color = if self.state.voice_active {
-                    Color::WHITE
-                } else {
-                    C::TEXT_MUTED
-                };
-
-                // Voice channel button
-                sidebar = sidebar.push(
-                    container(
-                        button(
-                            row![
-                                text("<<").size(11).color(C::TEXT_FAINT),
-                                Space::with_width(5),
-                                text("General").size(15).color(vc_name_color),
-                            ]
-                            .align_y(iced::Alignment::Center),
-                        )
-                        .on_press(Message::ToggleVoice)
-                        .width(Length::Fill)
-                        .padding(Padding::from([6, 8]))
-                        .style(if self.state.voice_active {
-                            theme::channel_button_active
-                        } else {
-                            theme::channel_button
-                        }),
-                    )
-                    .padding(pad4(0.0, 8.0, 0.0, 8.0)),
-                );
-
-                // Show connected users under the voice channel (Discord-style indent)
-                if self.state.voice_active {
-                    // Show self
-                    let self_name = self.state.profile.display_name.clone();
-                    let mut self_voice_row = Row::new()
-                        .spacing(0)
-                        .align_y(iced::Alignment::Center)
-                        .push(Space::with_width(28))
-                        .push(avatar(&self_name, 20.0, None))
-                        .push(Space::with_width(6))
-                        .push(text(self_name).size(13).color(C::TEXT_NORMAL));
-                    if self.state.voice_muted {
-                        self_voice_row = self_voice_row.push(text(" [M]").size(10).color(C::RED));
-                    }
-                    if self.state.voice_deafened {
-                        self_voice_row = self_voice_row.push(text(" [D]").size(10).color(C::RED));
-                    }
-                    sidebar = sidebar.push(
-                        container(
-                            self_voice_row,
-                        )
-                        .padding(pad4(2.0, 8.0, 2.0, 8.0)),
-                    );
-
-                    // Show other voice peers
-                    for (_pid, vp) in &self.state.voice_peers {
-                        let vp_name = vp.display_name.clone();
-                        let speaking = vp.speaking;
-                        sidebar = sidebar.push(
-                            container(
-                                {
-                                    let mut peer_row = Row::new()
-                                        .spacing(0)
-                                        .align_y(iced::Alignment::Center)
-                                        .push(Space::with_width(28))
-                                        .push(
-                                            container(avatar(&vp_name, 20.0, None))
-                                                .style(move |_t: &Theme| container::Style {
-                                                    border: iced::Border {
-                                                        width: if speaking { 2.0 } else { 0.0 },
-                                                        radius: 10.0.into(),
-                                                        color: C::GREEN,
-                                                    },
-                                                    ..Default::default()
-                                                }),
-                                        )
-                                        .push(Space::with_width(6))
-                                        .push(text(vp_name).size(13).color(
-                                            if speaking { C::GREEN } else { C::TEXT_NORMAL }
-                                        ));
-                                    if vp.muted {
-                                        peer_row = peer_row.push(text(" [M]").size(10).color(C::RED));
-                                    }
-                                    peer_row
-                                },
-                            )
-                            .padding(pad4(2.0, 8.0, 2.0, 8.0)),
-                        );
-                    }
-                }
-            }
-        }
-
-        // Direct Messages
-        sidebar = sidebar.push(Space::with_height(12));
-        sidebar = sidebar.push(section_header("DIRECT MESSAGES", None));
-        for (peer_id, profile) in &self.state.peers {
-            let is_active = self.state.active_dm_peer.as_ref() == Some(peer_id);
-            let name = profile.display_name.clone();
-            let pid = peer_id.clone();
-
-            sidebar = sidebar.push(
-                container(
-                    button(
-                        row![
-                            avatar(&name, 24.0, Some(profile.status)),
-                            Space::with_width(8),
-                            text(name).size(14).color(if is_active {
-                                Color::WHITE
-                            } else {
-                                C::TEXT_MUTED
-                            }),
-                        ]
-                        .align_y(iced::Alignment::Center),
-                    )
-                    .on_press(Message::SelectDM(pid))
-                    .width(Length::Fill)
-                    .padding(Padding::from([4, 8]))
-                    .style(if is_active {
-                        theme::channel_button_active
-                    } else {
-                        theme::channel_button
-                    }),
-                )
-                .padding(pad4(0.0, 8.0, 0.0, 8.0)),
-            );
-        }
-
-        // Push user panel to bottom
-        sidebar = sidebar.push(Space::with_height(Length::Fill));
-
-        // Voice connected panel (above user panel, Discord-style)
-        if self.state.voice_active {
-            let ch_name = self.state.voice_channel_name.clone().unwrap_or_else(|| "General".into());
-            sidebar = sidebar.push(
-                container(
-                    column![
-                        // "Voice Connected" header with green text
-                        row![
-                            text("Voice Connected").size(12).color(C::GREEN),
-                        ],
-                        // Channel name
-                        text(format!("#{}", ch_name)).size(11).color(C::TEXT_MUTED),
-                        Space::with_height(6),
-                        // Control buttons
-                        row![
-                            // Mute button
-                            button(
-                                text(if self.state.voice_muted { "Unmute" } else { "Mute" }).size(11),
-                            )
-                            .on_press(Message::ToggleMute)
-                            .style(if self.state.voice_muted {
-                                theme::voice_disconnect_button
-                            } else {
-                                theme::icon_button
-                            })
-                            .padding(Padding::from([4, 8])),
-                            Space::with_width(4),
-                            // Deafen button
-                            button(
-                                text(if self.state.voice_deafened { "Undeaf" } else { "Deafen" }).size(11),
-                            )
-                            .on_press(Message::ToggleDeafen)
-                            .style(if self.state.voice_deafened {
-                                theme::voice_disconnect_button
-                            } else {
-                                theme::icon_button
-                            })
-                            .padding(Padding::from([4, 8])),
-                            Space::with_width(4),
-                            // Screen share button
-                            button(
-                                text(if self.state.screen_sharing { "Stop" } else { "Share" }).size(11),
-                            )
-                            .on_press(Message::ToggleScreenShare)
-                            .style(if self.state.screen_sharing {
-                                theme::voice_disconnect_button
-                            } else {
-                                theme::icon_button
-                            })
-                            .padding(Padding::from([4, 8])),
-                            horizontal_space(),
-                            // Disconnect button
-                            button(
-                                text("Leave").size(11).color(C::RED),
-                            )
-                            .on_press(Message::ToggleVoice)
-                            .style(theme::voice_disconnect_button)
-                            .padding(Padding::from([4, 8])),
-                        ]
-                        .align_y(iced::Alignment::Center),
-                    ]
-                    .spacing(2),
-                )
-                .padding(Padding::from([10, 12]))
-                .style(theme::voice_connected),
-            );
-        }
-
-        // User panel
-        sidebar = sidebar.push(self.view_user_panel());
-
-        container(sidebar)
-            .height(Length::Fill)
-            .style(theme::sidebar)
-            .into()
-    }
-
-    // ── User panel (bottom of channel sidebar) ──────────────────────────
-
-    fn view_user_panel(&self) -> Element<Message> {
-        let _status_color = match self.state.profile.status {
-            UserStatus::Online => C::STATUS_ONLINE,
-            UserStatus::Away => C::STATUS_IDLE,
-            UserStatus::DoNotDisturb => C::STATUS_DND,
-            UserStatus::Offline => C::STATUS_OFFLINE,
-        };
-
-        container(
-            row![
-                button(
-                    row![
-                        avatar(
-                            &self.state.profile.display_name,
-                            32.0,
-                            Some(self.state.profile.status),
-                        ),
-                        Space::with_width(8),
-                        column![
-                            text(self.state.profile.display_name.clone())
-                                .size(13)
-                                .color(C::TEXT_NORMAL),
-                            text(format!("{}", self.state.profile.status))
-                                .size(11)
-                                .color(C::TEXT_MUTED),
-                        ]
-                        .spacing(1),
-                    ]
-                    .align_y(iced::Alignment::Center),
-                )
-                .on_press(Message::ChangeDisplayName)
-                .style(theme::user_panel_button)
-                .padding(Padding::from([4, 8])),
-                horizontal_space(),
-                // Settings button
-                tooltip(
-                    button(text("*").size(14).color(C::TEXT_MUTED))
-                        .on_press(Message::OpenSettings)
-                        .style(theme::icon_button)
-                        .padding(Padding::from([6, 8])),
-                    container(text("User Settings").size(12).color(C::TEXT_NORMAL))
-                        .padding(Padding::from([4, 8]))
-                        .style(theme::tooltip_box),
-                    tooltip::Position::Top,
-                )
-                .gap(4),
-            ]
-            .align_y(iced::Alignment::Center)
-            .padding(Padding::from([0, 8])),
-        )
-        .padding(Padding::from([8, 8]))
-        .style(theme::user_panel)
-        .into()
-    }
-
-    // ── Main area (messages + input) ────────────────────────────────────
-
-    fn view_main_area(&self) -> Element<Message> {
-        let mut main_col = Column::new().width(Length::Fill).height(Length::Fill);
-
-        // ── Channel header bar ──
-        let header_content = if let Some(ref peer_id) = self.state.active_dm_peer {
-            let name = self
-                .state
-                .peers
-                .get(peer_id)
-                .map(|p| p.display_name.clone())
-                .unwrap_or_else(|| peer_id[..8.min(peer_id.len())].to_string());
-            row![
-                text("@").size(20).color(C::TEXT_MUTED),
-                Space::with_width(6),
-                text(name).size(15).color(C::TEXT_BRIGHT),
-            ]
-            .align_y(iced::Alignment::Center)
-        } else if let (Some(si), Some(ci)) = (self.state.active_server, self.state.active_channel) {
-            if let Some(server) = self.state.servers.get(si) {
-                if let Some(channel) = server.channels.get(ci) {
-                    row![
-                        text("#").size(22).color(C::TEXT_MUTED),
-                        Space::with_width(6),
-                        text(channel.name.clone())
-                            .size(15)
-                            .color(C::TEXT_BRIGHT),
-                        Space::with_width(12),
-                        container(Space::new(1, 20))
-                            .style(|_t: &Theme| container::Style {
-                                background: Some(C::BORDER.into()),
-                                ..Default::default()
-                            }),
-                        Space::with_width(12),
-                        text(format!("{} members", self.state.peers.len() + 1))
-                            .size(13)
-                            .color(C::TEXT_MUTED),
-                        horizontal_space(),
-                        button(text("search").size(11).color(C::TEXT_FAINT))
-                            .on_press(Message::OpenSearch)
-                            .style(theme::icon_button)
-                            .padding(Padding::from([4, 8])),
-                        Space::with_width(4),
-                        connection_badge(self.connected),
-                    ]
-                    .align_y(iced::Alignment::Center)
-                } else {
-                    row![text("Select a channel").size(15).color(C::TEXT_MUTED)]
-                }
-            } else {
-                row![text("Select a server").size(15).color(C::TEXT_MUTED)]
-            }
-        } else {
-            row![text("Welcome to murmur").size(15).color(C::TEXT_BRIGHT)]
-        };
-
-        main_col = main_col.push(
-            container(header_content)
-                .padding(Padding::from([12, 16]))
-                .width(Length::Fill)
-                .style(theme::main_header),
-        );
-
-        // ── Messages area ──
-        let mut messages_col = Column::new().spacing(0);
-
-        // Welcome message at top
-        if let (Some(si), Some(ci)) = (self.state.active_server, self.state.active_channel) {
-            if let Some(server) = self.state.servers.get(si) {
-                if let Some(channel) = server.channels.get(ci) {
-                    let ch_name = channel.name.clone();
-                    messages_col = messages_col.push(
-                        container(
-                            column![
-                                container(
-                                    text("#").size(48).color(Color::WHITE),
-                                )
-                                .width(68)
-                                .height(68)
-                                .center_x(68)
-                                .center_y(68)
-                                .style(theme::welcome_icon),
-                                Space::with_height(8),
-                                text(format!("Welcome to #{}", ch_name))
-                                    .size(28)
-                                    .color(C::TEXT_BRIGHT),
-                                Space::with_height(4),
-                                text(format!(
-                                    "This is the start of the #{} channel.",
-                                    ch_name
-                                ))
-                                .size(14)
-                                .color(C::TEXT_MUTED),
-                            ]
-                            .spacing(4),
-                        )
-                        .padding(Padding::from([24, 16])),
-                    );
-
-                    messages_col = messages_col.push(date_separator("Today"));
-                }
-            }
-        }
-
-        // Render messages grouped by sender
-        if self.state.active_dm_peer.is_some() {
-            let msgs = self.state.current_dm_messages();
-            let mut last_sender: Option<String> = None;
-            for msg in &msgs {
-                let is_continuation = last_sender.as_ref() == Some(&msg.from_peer_id);
-                messages_col = messages_col.push(dm_widget(msg, is_continuation));
-                last_sender = Some(msg.from_peer_id.clone());
-            }
-        } else {
-            let msgs = self.state.current_messages();
-            let mut last_sender: Option<String> = None;
-            for msg in &msgs {
-                let is_continuation = last_sender.as_ref() == Some(&msg.sender_peer_id);
-                messages_col =
-                    messages_col.push(message_widget(msg, is_continuation, false));
-                last_sender = Some(msg.sender_peer_id.clone());
-            }
-        }
-
-        main_col = main_col.push(
-            scrollable(messages_col)
-                .height(Length::Fill)
-                .anchor_bottom(),
-        );
-
-        // ── Typing indicator ──
-        main_col = main_col.push(typing_indicator(&self.typing_names, self.anim_tick));
-
-        // ── Reply banner ──
-        if let Some(ref reply_id) = self.reply_to_id {
-            let reply_preview = self.state.find_message(reply_id)
-                .map(|m| format!("Replying to {} — {}", m.sender_name, if m.content.len() > 50 { format!("{}...", &m.content[..50]) } else { m.content.clone() }))
-                .unwrap_or_else(|| "Replying to message".into());
-            main_col = main_col.push(
-                container(
-                    row![
-                        text(reply_preview).size(11).color(C::TEXT_DIM),
-                        horizontal_space(),
-                        button(text("x").size(11).color(C::TEXT_FAINT))
-                            .on_press(Message::CancelReply)
-                            .style(theme::icon_button)
-                            .padding(Padding::from([0, 6])),
-                    ]
-                    .align_y(iced::Alignment::Center),
-                )
-                .padding(pad4(4.0, 20.0, 4.0, 20.0))
-                .style(|_t: &Theme| container::Style {
-                    background: Some(C::BG_ELEVATED.into()),
-                    ..Default::default()
-                }),
-            );
-        }
-
-        // ── Input area ──
-        let channel_name = if self.state.active_dm_peer.is_some() {
-            "Message".to_string()
-        } else if let (Some(si), Some(ci)) = (self.state.active_server, self.state.active_channel) {
-            self.state
-                .servers
-                .get(si)
-                .and_then(|s| s.channels.get(ci))
-                .map(|c| format!("Message #{}", c.name))
-                .unwrap_or_else(|| "Type a message...".to_string())
-        } else {
-            "Type a message...".to_string()
-        };
-
-        let input_row = row![
-            button(text("+").size(18).color(C::TEXT_MUTED))
-                .on_press(Message::Noop)
-                .style(theme::icon_button)
-                .padding(Padding::from([8, 12])),
-            text_input(&channel_name, &self.state.input_buffer)
-                .on_input(Message::InputChanged)
-                .on_submit(Message::SendMessage)
-                .padding(Padding::from([10, 0]))
-                .size(14)
-                .style(|_t: &Theme, _s| text_input::Style {
-                    background: Color::TRANSPARENT.into(),
-                    border: iced::Border::default(),
-                    icon: C::TEXT_MUTED,
-                    placeholder: C::TEXT_MUTED,
-                    value: C::TEXT_NORMAL,
-                    selection: C::GREEN,
-                }),
-        ]
-        .align_y(iced::Alignment::Center);
-
-        main_col = main_col.push(
-            container(
-                container(input_row)
-                    .padding(Padding::from([4, 8]))
-                    .style(|_t: &Theme| container::Style {
-                        background: Some(C::BG_ELEVATED.into()),
-                        border: iced::Border {
-                            width: 0.0,
-                            radius: 8.0.into(),
-                            color: Color::TRANSPARENT,
-                        },
-                        ..Default::default()
-                    }),
-            )
-            .padding(pad4(0.0, 16.0, 22.0, 16.0)),
-        );
-
-        container(main_col)
-            .style(theme::main_area)
-            .into()
-    }
-
-    // ── Member sidebar ──────────────────────────────────────────────────
-
-    fn view_member_sidebar(&self) -> Element<Message> {
-        let mut sidebar = Column::new().spacing(2).width(240).padding(Padding::from([0, 8]));
-
-        // Online section
-        let online_count = self
-            .state
-            .peers
-            .values()
-            .filter(|p| p.status != UserStatus::Offline)
-            .count()
-            + 1; // +1 for self
-
-        sidebar = sidebar.push(
-            container(
-                text(format!("ONLINE - {}", online_count))
-                    .size(11)
-                    .color(C::TEXT_MUTED),
-            )
-            .padding(pad4(16.0, 8.0, 4.0, 16.0)),
-        );
-
-        // Self
-        let self_name = self.state.profile.display_name.clone();
-        sidebar = sidebar.push(
-            container(
-                button(
-                    row![
-                        avatar(&self_name, 32.0, Some(self.state.profile.status)),
-                        Space::with_width(8),
-                        column![
-                            text(self_name).size(13).color(C::TEXT_NORMAL),
-                            text("(you)").size(11).color(C::TEXT_MUTED),
-                        ]
-                        .spacing(1),
-                    ]
-                    .align_y(iced::Alignment::Center)
-                    .padding(Padding::from([4, 0])),
-                )
-                .on_press(Message::Noop)
-                .width(Length::Fill)
-                .padding(Padding::from([2, 8]))
-                .style(theme::member_button),
-            )
-            .padding(Padding::from([0, 8])),
-        );
-
-        // Online peers
-        let mut offline_peers: Vec<(&String, &UserProfile)> = Vec::new();
-        for (peer_id, profile) in &self.state.peers {
-            match profile.status {
-                UserStatus::Offline => {
-                    offline_peers.push((peer_id, profile));
-                }
-                _ => {
-                    sidebar = sidebar.push(
-                        container(member_entry(peer_id, profile))
-                            .padding(Padding::from([0, 8])),
-                    );
-                }
-            }
-        }
-
-        // Offline section
-        if !offline_peers.is_empty() {
-            sidebar = sidebar.push(Space::with_height(8));
-            sidebar = sidebar.push(
-                container(
-                    text(format!("OFFLINE - {}", offline_peers.len()))
-                        .size(11)
-                        .color(C::TEXT_MUTED),
-                )
-                .padding(pad4(8.0, 8.0, 4.0, 16.0)),
-            );
-
-            for (peer_id, profile) in offline_peers {
-                sidebar = sidebar.push(
-                    container(member_entry(peer_id, profile))
-                        .padding(Padding::from([0, 8])),
-                );
-            }
-        }
-
-        container(scrollable(sidebar))
-            .height(Length::Fill)
-            .style(theme::member_panel)
-            .into()
-    }
-
-    // ── Context menu ────────────────────────────────────────────────────
-
-    fn view_context_menu(&self, kind: &ContextMenuKind) -> Element<Message> {
-        let items = match kind {
-            ContextMenuKind::Server(idx) => {
-                let idx = *idx;
-                vec![
-                    ContextMenuItem::Action {
-                        label: "Create Channel".into(),
-                        message: Message::CreateChannel,
-                        danger: false,
-                    },
-                    ContextMenuItem::Action {
-                        label: "Invite People".into(),
-                        message: Message::Noop,
-                        danger: false,
-                    },
-                    ContextMenuItem::Separator,
-                    ContextMenuItem::Action {
-                        label: "Notification Settings".into(),
-                        message: Message::Noop,
-                        danger: false,
-                    },
-                    ContextMenuItem::Separator,
-                    ContextMenuItem::Action {
-                        label: "Leave Server".into(),
-                        message: Message::LeaveServer(idx),
-                        danger: true,
-                    },
-                ]
-            }
-            ContextMenuKind::Channel(idx) => {
-                let idx = *idx;
-                vec![
-                    ContextMenuItem::Action {
-                        label: "Edit Channel".into(),
-                        message: Message::Noop,
-                        danger: false,
-                    },
-                    ContextMenuItem::Action {
-                        label: "Mute Channel".into(),
-                        message: Message::MuteChannel(idx),
-                        danger: false,
-                    },
-                    ContextMenuItem::Separator,
-                    ContextMenuItem::Action {
-                        label: "Copy Channel ID".into(),
-                        message: Message::Noop,
-                        danger: false,
-                    },
-                ]
-            }
-            ContextMenuKind::Member(peer_id) => {
-                let pid = peer_id.clone();
-                vec![
-                    ContextMenuItem::Action {
-                        label: "Message".into(),
-                        message: Message::SelectDM(pid.clone()),
-                        danger: false,
-                    },
-                    ContextMenuItem::Action {
-                        label: "Call".into(),
-                        message: Message::Noop,
-                        danger: false,
-                    },
-                    ContextMenuItem::Separator,
-                    ContextMenuItem::Action {
-                        label: "Copy User ID".into(),
-                        message: Message::CopyPeerId(pid),
-                        danger: false,
-                    },
-                ]
-            }
-            ContextMenuKind::Message(msg_id) => {
-                let mid = msg_id.clone();
-                // Find message content for copy
-                let msg_content = self.state.find_message(&mid)
-                    .map(|m| m.content.clone())
-                    .unwrap_or_default();
-                let is_own = self.state.find_message(&mid)
-                    .map(|m| m.sender_peer_id == self.state.profile.peer_id)
-                    .unwrap_or(false);
-
-                let mut items = vec![
-                    ContextMenuItem::Action {
-                        label: "Reply".into(),
-                        message: Message::ReplyTo(mid.clone()),
-                        danger: false,
-                    },
-                    ContextMenuItem::Action {
-                        label: "React +1".into(),
-                        message: Message::ReactToMessage(mid.clone(), "+1".into()),
-                        danger: false,
-                    },
-                    ContextMenuItem::Action {
-                        label: "Copy Text".into(),
-                        message: Message::CopyToClipboard(msg_content),
-                        danger: false,
-                    },
-                    ContextMenuItem::Separator,
-                    ContextMenuItem::Action {
-                        label: "Copy Message ID".into(),
-                        message: Message::CopyToClipboard(mid.clone()),
-                        danger: false,
-                    },
-                ];
-
-                if is_own {
-                    items.push(ContextMenuItem::Separator);
-                    items.push(ContextMenuItem::Action {
-                        label: "Delete Message".into(),
-                        message: Message::DeleteMessage(mid),
-                        danger: true,
-                    });
-                }
-
-                items
-            }
-        };
-
-        context_menu_widget(items)
-    }
-
-    // ── Modal ───────────────────────────────────────────────────────────
-
-    fn view_modal(&self) -> Element<Message> {
-        if self.modal == ActiveModal::Settings {
-            return self.view_settings_modal();
-        }
-
-        let (title, subtitle, placeholder) = match self.modal {
-            ActiveModal::CreateServer => (
-                "Create a Server",
-                "Your server is where you and your friends hang out.",
-                "Server name...",
-            ),
-            ActiveModal::JoinServer => (
-                "Join a Server",
-                "Enter the name of a server to join its community.",
-                "Server name...",
-            ),
-            ActiveModal::CreateChannel => (
-                "Create Channel",
-                "in the current server",
-                "new-channel",
-            ),
-            ActiveModal::ChangeDisplayName => (
-                "Change Display Name",
-                "This is how others see you.",
-                "Display name...",
-            ),
-            ActiveModal::ConnectPeer => (
-                "Connect to Peer",
-                "Paste a peer's multiaddr to connect directly.",
-                "/ip4/.../tcp/.../p2p/12D3K...",
-            ),
-            ActiveModal::None | ActiveModal::Settings => ("", "", ""),
-        };
-
-        let input_msg: fn(String) -> Message = match self.modal {
-            ActiveModal::CreateServer | ActiveModal::JoinServer => Message::ServerNameInput,
-            ActiveModal::CreateChannel => Message::ChannelNameInput,
-            ActiveModal::ChangeDisplayName => Message::DisplayNameInput,
-            ActiveModal::ConnectPeer => Message::ConnectAddrInput,
-            ActiveModal::None | ActiveModal::Settings => Message::ServerNameInput,
-        };
-
-        let modal_content = column![
-            text(title)
-                .size(22)
-                .color(C::TEXT_BRIGHT),
-            text(subtitle)
-                .size(13)
-                .color(C::TEXT_MUTED),
-            Space::with_height(16),
-            text("NAME").size(11).color(C::TEXT_MUTED),
-            Space::with_height(4),
-            text_input(placeholder, &self.modal_input)
-                .on_input(input_msg)
-                .on_submit(Message::ConfirmModal)
-                .padding(10)
-                .size(14)
-                .style(theme::modal_input),
-            Space::with_height(20),
-            // Footer with buttons
-            container(
-                row![
-                    button(
-                        text("Cancel").size(14).color(C::TEXT_NORMAL),
-                    )
-                    .on_press(Message::CloseModal)
-                    .style(theme::modal_cancel)
-                    .padding(Padding::from([10, 20])),
-                    horizontal_space(),
-                    button(
-                        text(match self.modal {
-                            ActiveModal::CreateServer => "Create",
-                            ActiveModal::JoinServer => "Join",
-                            ActiveModal::CreateChannel => "Create Channel",
-                            ActiveModal::ChangeDisplayName => "Save",
-                            ActiveModal::ConnectPeer => "Connect",
-                            ActiveModal::None | ActiveModal::Settings => "OK",
-                        })
-                        .size(14),
-                    )
-                    .on_press(Message::ConfirmModal)
-                    .style(theme::modal_confirm)
-                    .padding(Padding::from([10, 24])),
-                ]
-                .align_y(iced::Alignment::Center),
-            )
-            .padding(pad4(16.0, 0.0, 0.0, 0.0))
-            .style(|_t: &Theme| container::Style {
-                border: iced::Border {
-                    width: 0.0,
-                    ..Default::default()
-                },
-                ..Default::default()
-            }),
-        ]
-        .spacing(4)
-        .max_width(360);
-
-        container(
-            container(modal_content)
-                .padding(pad4(24.0, 24.0, 16.0, 24.0))
-                .style(theme::modal_card),
-        )
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center_x(Length::Shrink)
-        .center_y(Length::Shrink)
-        .into()
-    }
-
-    // ── Network event handler ───────────────────────────────────────────
-
-    // ── Settings modal ───────────────────────────────────────────────
-
-    fn view_settings_modal(&self) -> Element<Message> {
-        let audio = &self.state.audio;
-
-        // Your addresses section
-        let mut addr_col = Column::new().spacing(3);
-        addr_col = addr_col.push(text("YOUR ADDRESS (share with friends to connect)").size(10).color(C::TEXT_FAINT));
-        if self.state.listen_addrs.is_empty() {
-            addr_col = addr_col.push(text("Waiting for network...").size(11).color(C::TEXT_MUTED));
-        } else {
-            for addr in &self.state.listen_addrs {
-                let addr_clone = addr.clone();
-                addr_col = addr_col.push(
-                    button(
-                        text(addr.clone()).size(10).color(C::TEXT_DIM),
-                    )
-                    .on_press(Message::CopyToClipboard(addr_clone))
-                    .padding(Padding::from([3, 6]))
-                    .style(|_t: &Theme, status: button::Status| button::Style {
-                        background: Some(match status {
-                            button::Status::Hovered => Color::from_rgb(0.12, 0.12, 0.12),
-                            _ => C::BG_ELEVATED,
-                        }.into()),
-                        text_color: match status {
-                            button::Status::Hovered => C::TEXT_NORMAL,
-                            _ => C::TEXT_DIM,
-                        },
-                        border: iced::Border { radius: 3.0.into(), ..Default::default() },
-                        ..Default::default()
-                    }),
-                );
-            }
-        }
-
-        // Input device picker
-        let mut input_col = Column::new().spacing(4);
-        input_col = input_col.push(text("INPUT DEVICE").size(11).color(C::TEXT_MUTED));
-        // Default option
-        input_col = input_col.push(
-            button(
-                text(format!("{}  System Default", if audio.input_device.is_none() { ">" } else { " " }))
-                    .size(13)
-                    .color(if audio.input_device.is_none() { Color::WHITE } else { C::TEXT_NORMAL }),
-            )
-            .on_press(Message::SetInputDevice("Default".into()))
-            .width(Length::Fill)
-            .padding(Padding::from([4, 8]))
-            .style(if audio.input_device.is_none() { theme::channel_button_active } else { theme::channel_button }),
-        );
-        for dev in &audio.available_inputs {
-            let is_selected = audio.input_device.as_ref() == Some(dev);
-            let dev_name = dev.clone();
-            input_col = input_col.push(
-                button(
-                    text(format!("{}  {}", if is_selected { ">" } else { " " }, dev))
-                        .size(13)
-                        .color(if is_selected { Color::WHITE } else { C::TEXT_NORMAL }),
-                )
-                .on_press(Message::SetInputDevice(dev_name))
-                .width(Length::Fill)
-                .padding(Padding::from([4, 8]))
-                .style(if is_selected { theme::channel_button_active } else { theme::channel_button }),
-            );
-        }
-
-        // Output device picker
-        let mut output_col = Column::new().spacing(4);
-        output_col = output_col.push(text("OUTPUT DEVICE").size(11).color(C::TEXT_MUTED));
-        output_col = output_col.push(
-            button(
-                text(format!("{}  System Default", if audio.output_device.is_none() { ">" } else { " " }))
-                    .size(13)
-                    .color(if audio.output_device.is_none() { Color::WHITE } else { C::TEXT_NORMAL }),
-            )
-            .on_press(Message::SetOutputDevice("Default".into()))
-            .width(Length::Fill)
-            .padding(Padding::from([4, 8]))
-            .style(if audio.output_device.is_none() { theme::channel_button_active } else { theme::channel_button }),
-        );
-        for dev in &audio.available_outputs {
-            let is_selected = audio.output_device.as_ref() == Some(dev);
-            let dev_name = dev.clone();
-            output_col = output_col.push(
-                button(
-                    text(format!("{}  {}", if is_selected { ">" } else { " " }, dev))
-                        .size(13)
-                        .color(if is_selected { Color::WHITE } else { C::TEXT_NORMAL }),
-                )
-                .on_press(Message::SetOutputDevice(dev_name))
-                .width(Length::Fill)
-                .padding(Padding::from([4, 8]))
-                .style(if is_selected { theme::channel_button_active } else { theme::channel_button }),
-            );
-        }
-
-        // Volume sliders (using buttons as +/- since iced 0.13 slider API varies)
-        let input_vol_pct = (audio.input_volume * 100.0) as u32;
-        let output_vol_pct = (audio.output_volume * 100.0) as u32;
-
-        let input_vol_row = row![
-            text("Input Volume").size(13).color(C::TEXT_NORMAL),
-            horizontal_space(),
-            button(text("-").size(14)).on_press(Message::SetInputVolume((audio.input_volume - 0.1).max(0.0)))
-                .style(theme::icon_button).padding(Padding::from([2, 8])),
-            text(format!("{}%", input_vol_pct)).size(13).color(C::TEXT_NORMAL),
-            button(text("+").size(14)).on_press(Message::SetInputVolume((audio.input_volume + 0.1).min(2.0)))
-                .style(theme::icon_button).padding(Padding::from([2, 8])),
-        ].align_y(iced::Alignment::Center).spacing(4);
-
-        let output_vol_row = row![
-            text("Output Volume").size(13).color(C::TEXT_NORMAL),
-            horizontal_space(),
-            button(text("-").size(14)).on_press(Message::SetOutputVolume((audio.output_volume - 0.1).max(0.0)))
-                .style(theme::icon_button).padding(Padding::from([2, 8])),
-            text(format!("{}%", output_vol_pct)).size(13).color(C::TEXT_NORMAL),
-            button(text("+").size(14)).on_press(Message::SetOutputVolume((audio.output_volume + 0.1).min(2.0)))
-                .style(theme::icon_button).padding(Padding::from([2, 8])),
-        ].align_y(iced::Alignment::Center).spacing(4);
-
-        // Noise suppression toggle
-        let ns_row = row![
-            text("Noise Suppression").size(13).color(C::TEXT_NORMAL),
-            horizontal_space(),
-            button(text(if audio.noise_suppression { "ON" } else { "OFF" }).size(12))
-                .on_press(Message::ToggleNoiseSuppression)
-                .style(if audio.noise_suppression { theme::modal_confirm } else { theme::icon_button })
-                .padding(Padding::from([4, 12])),
-        ].align_y(iced::Alignment::Center);
-
-        // VAD threshold
-        let vad_pct = (audio.vad_threshold * 100.0) as u32;
-        let vad_row = row![
-            text("Voice Activation").size(13).color(C::TEXT_NORMAL),
-            horizontal_space(),
-            button(text("-").size(14)).on_press(Message::SetVadThreshold((audio.vad_threshold - 0.05).max(0.0)))
-                .style(theme::icon_button).padding(Padding::from([2, 8])),
-            text(format!("{}%", vad_pct)).size(13).color(C::TEXT_NORMAL),
-            button(text("+").size(14)).on_press(Message::SetVadThreshold((audio.vad_threshold + 0.05).min(1.0)))
-                .style(theme::icon_button).padding(Padding::from([2, 8])),
-        ].align_y(iced::Alignment::Center).spacing(4);
-
-        // Mic test
-        let mic_level_width = (audio.mic_level * 300.0) as f32;
-        let mic_test_section = column![
-            row![
-                text("MIC TEST").size(11).color(C::TEXT_MUTED),
-                horizontal_space(),
-                button(
-                    text(if audio.mic_testing { "Stop Test" } else { "Test Mic" }).size(12),
-                )
-                .on_press(if audio.mic_testing { Message::StopMicTest } else { Message::StartMicTest })
-                .style(if audio.mic_testing { theme::voice_disconnect_button } else { theme::modal_confirm })
-                .padding(Padding::from([4, 12])),
-            ].align_y(iced::Alignment::Center),
-            Space::with_height(4),
-            // Level meter bar
-            container(
-                container(Space::new(mic_level_width, 8))
-                    .style(move |_t: &Theme| container::Style {
-                        background: Some(if mic_level_width > 200.0 {
-                            C::RED
-                        } else if mic_level_width > 100.0 {
-                            C::YELLOW
-                        } else {
-                            C::GREEN
-                        }.into()),
-                        border: iced::Border { radius: 2.0.into(), ..Default::default() },
-                        ..Default::default()
-                    }),
-            )
-            .width(300)
-            .style(|_t: &Theme| container::Style {
-                background: Some(C::BG_DEEPEST.into()),
-                border: iced::Border { radius: 3.0.into(), ..Default::default() },
-                ..Default::default()
-            }),
-        ];
-
-        let settings_content = column![
-            text("Voice & Audio Settings").size(20).color(C::TEXT_BRIGHT),
-            Space::with_height(12),
-            scrollable(
-                column![
-                    addr_col,
-                    Space::with_height(12),
-                    horizontal_rule(1),
-                    Space::with_height(12),
-                    input_col,
-                    Space::with_height(12),
-                    output_col,
-                    Space::with_height(16),
-                    horizontal_rule(1),
-                    Space::with_height(12),
-                    input_vol_row,
-                    Space::with_height(8),
-                    output_vol_row,
-                    Space::with_height(16),
-                    horizontal_rule(1),
-                    Space::with_height(12),
-                    ns_row,
-                    Space::with_height(8),
-                    vad_row,
-                    Space::with_height(16),
-                    horizontal_rule(1),
-                    Space::with_height(12),
-                    mic_test_section,
-                ]
-                .spacing(2),
-            )
-            .height(400),
-            Space::with_height(12),
-            container(
-                button(text("Close").size(14).color(C::TEXT_NORMAL))
-                    .on_press(Message::CloseModal)
-                    .style(theme::modal_cancel)
-                    .padding(Padding::from([10, 24])),
-            )
-            .width(Length::Fill)
-            .align_x(iced::alignment::Horizontal::Right),
-        ]
-        .max_width(500);
-
-        container(
-            container(settings_content)
-                .padding(Padding::from(24))
-                .style(theme::modal_card),
-        )
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center_x(Length::Shrink)
-        .center_y(Length::Shrink)
-        .into()
-    }
-
-    // ── Search panel ─────────────────────────────────────────────────
-
-    fn view_search_panel(&self) -> Element<Message> {
-        let mut panel = Column::new().spacing(4).width(240).padding(Padding::from([0, 8]));
-
-        // Header with close button
-        panel = panel.push(
-            container(
-                row![
-                    text("Search").size(13).color(C::TEXT_BRIGHT),
-                    horizontal_space(),
-                    button(text("x").size(12).color(C::TEXT_FAINT))
-                        .on_press(Message::CloseSearch)
-                        .style(theme::icon_button)
-                        .padding(Padding::from([2, 6])),
-                ]
-                .align_y(iced::Alignment::Center),
-            )
-            .padding(Padding::from([12, 8])),
-        );
-
-        // Search input
-        panel = panel.push(
-            container(
-                text_input("search messages...", &self.search_query)
-                    .on_input(Message::SearchInput)
-                    .size(12)
-                    .padding(Padding::from([6, 8]))
-                    .style(theme::modal_input),
-            )
-            .padding(Padding::from([0, 8])),
-        );
-
-        panel = panel.push(Space::with_height(8));
-
-        // Results
-        if self.search_results.is_empty() && self.search_query.len() >= 2 {
-            panel = panel.push(
-                container(text("No results").size(11).color(C::TEXT_FAINT))
-                    .padding(Padding::from([8, 8])),
-            );
-        }
-
-        let mut results_col = Column::new().spacing(2);
-        for msg in &self.search_results {
-            let name = msg.sender_name.clone();
-            let content = if msg.content.len() > 60 {
-                format!("{}...", &msg.content[..60])
-            } else {
-                msg.content.clone()
-            };
-            let time = msg.timestamp.format("%m/%d %H:%M").to_string();
-
-            results_col = results_col.push(
-                container(
-                    column![
-                        row![
-                            text(name).size(11).color(C::TEXT_NORMAL),
-                            Space::with_width(4),
-                            text(time).size(9).color(C::TEXT_FAINT),
-                        ].align_y(iced::Alignment::Center),
-                        text(content).size(11).color(C::TEXT_DIM),
-                    ]
-                    .spacing(2),
-                )
-                .padding(Padding::from([4, 8]))
-                .width(Length::Fill)
-                .style(|_t: &Theme| container::Style {
-                    border: iced::Border {
-                        width: 0.0,
-                        radius: 4.0.into(),
-                        color: Color::TRANSPARENT,
-                    },
-                    ..Default::default()
-                }),
-            );
-        }
-
-        panel = panel.push(scrollable(results_col).height(Length::Fill));
-
-        container(panel)
-            .height(Length::Fill)
-            .style(theme::member_panel)
-            .into()
-    }
-
-    fn handle_net_event(&mut self, event: NetEvent) {
+    fn handle_event(&mut self, event: NetEvent) {
         match event {
-            NetEvent::MessageReceived(msg) => {
-                self.state.add_message(msg);
-            }
-            NetEvent::DirectMessageReceived(msg) => {
-                self.state.add_direct_message(msg);
-            }
+            NetEvent::MessageReceived(msg) => self.state.add_message(msg),
+            NetEvent::DirectMessageReceived(msg) => self.state.add_direct_message(msg),
             NetEvent::PeerDiscovered { peer_id, name } => {
                 self.state.update_peer(peer_id.to_string(), name, UserStatus::Online);
             }
             NetEvent::PeerLeft(peer_id) => {
-                if let Some(profile) = self.state.peers.get_mut(&peer_id.to_string()) {
-                    profile.status = UserStatus::Offline;
+                if let Some(p) = self.state.peers.get_mut(&peer_id.to_string()) {
+                    p.status = UserStatus::Offline;
                     self.state.persist_peers();
                 }
             }
-            NetEvent::PresenceUpdate {
-                peer_id,
-                name,
-                status,
-            } => {
+            NetEvent::PresenceUpdate { peer_id, name, status } => {
                 self.state.update_peer(peer_id, name, status);
             }
-            NetEvent::ServerJoined {
-                peer_id,
-                name,
-                server_id: _,
-            } => {
+            NetEvent::ServerJoined { peer_id, name, .. } => {
                 self.state.update_peer(peer_id, name, UserStatus::Online);
             }
-            NetEvent::ChannelCreated {
-                server_id,
-                channel,
-            } => {
+            NetEvent::ChannelCreated { server_id, channel } => {
                 self.state.add_channel_to_server(&server_id, channel);
+            }
+            NetEvent::Connected => self.connected = true,
+            NetEvent::ListeningOn(addr) => {
+                if !self.state.listen_addrs.contains(&addr) {
+                    self.state.listen_addrs.push(addr);
+                }
+            }
+            NetEvent::PeerTyping { name, .. } => {
+                if !self.typing_names.contains(&name) {
+                    self.typing_names.push(name);
+                }
             }
             NetEvent::PeerSpeaking { peer_id, is_speaking } => {
                 if let Some(vp) = self.state.voice_peers.get_mut(&peer_id) {
                     vp.speaking = is_speaking;
                 }
             }
+            NetEvent::PeerVoiceJoined { peer_id, name } => {
+                let display_name = self.state.peers.get(&peer_id)
+                    .map(|p| p.display_name.clone())
+                    .unwrap_or_else(|| name[..8.min(name.len())].to_string());
+                self.state.voice_peers.insert(peer_id.clone(), crate::state::VoicePeerState {
+                    peer_id, display_name, speaking: false, muted: false, deafened: false,
+                });
+            }
+            NetEvent::PeerVoiceLeft { peer_id } => { self.state.voice_peers.remove(&peer_id); }
             NetEvent::MessageEdited { message_id, new_content, peer_id } => {
                 self.state.edit_message(&message_id, &new_content, &peer_id);
             }
@@ -2041,79 +129,715 @@ impl MurmurApp {
             NetEvent::MessageReaction { message_id, emoji, peer_id } => {
                 self.state.toggle_reaction(&message_id, &emoji, &peer_id);
             }
-            NetEvent::PeerTyping { peer_id: _, name } => {
-                if !self.typing_names.contains(&name) {
-                    self.typing_names.push(name);
-                }
-            }
-            NetEvent::PeerVoiceJoined { peer_id, name } => {
-                let display_name = self.state.peers.get(&peer_id)
-                    .map(|p| p.display_name.clone())
-                    .unwrap_or_else(|| name[..8.min(name.len())].to_string());
-                self.state.voice_peers.insert(peer_id.clone(), crate::state::VoicePeerState {
-                    peer_id,
-                    display_name,
-                    speaking: false,
-                    muted: false,
-                    deafened: false,
-                });
-            }
-            NetEvent::PeerVoiceLeft { peer_id } => {
-                self.state.voice_peers.remove(&peer_id);
-            }
-            NetEvent::Connected => {
-                self.connected = true;
-                for server in &self.state.servers {
-                    for channel in &server.channels {
-                        let topic = server.topic_for_channel(&channel.id);
-                        let _ = self.net_cmd_tx.send(NetCommand::JoinServer(topic));
-                    }
-                }
-            }
-            NetEvent::ListeningOn(addr) => {
-                if !self.state.listen_addrs.contains(&addr) {
-                    self.state.listen_addrs.push(addr);
-                }
-            }
-            NetEvent::Error(e) => {
-                tracing::error!("Network error: {}", e);
-            }
+            NetEvent::Error(_) => {}
         }
     }
 
-    fn subscribe_to_current_channel(&self) {
-        if let Some(topic) = self.state.current_topic() {
-            let _ = self.net_cmd_tx.send(NetCommand::JoinServer(topic));
+    fn send_message(&mut self) {
+        let content = self.state.input_buffer.trim().to_string();
+        if content.is_empty() { return; }
+
+        if content.starts_with('/') {
+            self.handle_slash(&content);
+            self.state.input_buffer.clear();
+            return;
         }
+
+        if let (Some(si), Some(ci)) = (self.state.active_server, self.state.active_channel) {
+            if let Some(server) = self.state.servers.get(si) {
+                if let Some(channel) = server.channels.get(ci) {
+                    let mut msg = ChatMessage::new(
+                        server.id.clone(), channel.id.clone(),
+                        self.state.profile.peer_id.clone(),
+                        self.state.profile.display_name.clone(),
+                        content,
+                    );
+                    msg.reply_to = self.reply_to_id.take();
+                    self.state.add_message(msg.clone());
+                    let _ = self.cmd_tx.send(NetCommand::SendMessage(msg));
+                }
+            }
+        }
+        self.state.input_buffer.clear();
     }
 
-    fn handle_command(&mut self, cmd: &str) -> IcedTask<Message> {
+    fn handle_slash(&mut self, cmd: &str) {
         let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
         match parts[0] {
             "/name" if parts.len() > 1 => {
                 self.state.set_display_name(parts[1].to_string());
-                let _ = self
-                    .net_cmd_tx
-                    .send(NetCommand::UpdatePresence(self.state.profile.status));
-            }
-            "/status" if parts.len() > 1 => {
-                let status = match parts[1].to_lowercase().as_str() {
-                    "online" => UserStatus::Online,
-                    "away" => UserStatus::Away,
-                    "dnd" => UserStatus::DoNotDisturb,
-                    _ => UserStatus::Online,
-                };
-                self.state.profile.status = status;
-                let _ = self.net_cmd_tx.send(NetCommand::UpdatePresence(status));
+                let _ = self.cmd_tx.send(NetCommand::UpdatePresence(self.state.profile.status));
             }
             "/connect" if parts.len() > 1 => {
                 if let Ok(addr) = parts[1].parse() {
-                    let _ = self.net_cmd_tx.send(NetCommand::Dial(addr));
+                    let _ = self.cmd_tx.send(NetCommand::Dial(addr));
                 }
             }
             _ => {}
         }
-        self.state.input_buffer.clear();
-        IcedTask::none()
     }
+}
+
+impl eframe::App for MurmurApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        apply_theme(ctx);
+        self.poll_events();
+        self.anim_tick = self.anim_tick.wrapping_add(1);
+
+        // Clear typing every ~120 frames (~2 sec at 60fps)
+        if self.anim_tick % 120 == 0 {
+            self.typing_names.clear();
+        }
+
+        // Update mic test level
+        if let Some(ref tester) = self.mic_tester {
+            self.state.audio.mic_level = tester.level();
+        }
+
+        // Update window title with unread
+        if self.state.total_unread > 0 {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(
+                format!("murmur ({}) - {}", self.state.total_unread, self.state.profile.display_name)
+            ));
+        }
+
+        // Escape key
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if self.modal != Modal::None { self.modal = Modal::None; }
+            else if self.search_open { self.search_open = false; }
+            else { self.reply_to_id = None; }
+        }
+
+        // Ctrl+K for search
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::K)) {
+            self.search_open = !self.search_open;
+        }
+
+        // ── Top bar ──
+        egui::TopBottomPanel::top("topbar").frame(
+            egui::Frame::new().fill(BG_DEEPEST).inner_margin(egui::Margin::symmetric(12, 6))
+        ).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                // Home
+                if ui.add(egui::Button::new(RichText::new("dc").color(GREEN).size(13.0))
+                    .min_size(Vec2::new(36.0, 36.0))
+                    .fill(BG_ELEVATED)
+                    .rounding(8.0)
+                ).clicked() {}
+
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(4.0);
+
+                // Servers
+                for (i, server) in self.state.servers.clone().iter().enumerate() {
+                    let active = self.state.active_server == Some(i);
+                    let btn = egui::Button::new(
+                        RichText::new(initials(&server.name)).size(13.0)
+                            .color(if active { TEXT_BRIGHT } else { TEXT_MUTED })
+                    )
+                    .min_size(Vec2::new(36.0, 36.0))
+                    .fill(BG_ELEVATED)
+                    .rounding(if active { 8.0 } else { 10.0 })
+                    .stroke(if active { egui::Stroke::new(1.5, TEXT_FAINT) } else { egui::Stroke::NONE });
+
+                    let resp = ui.add(btn);
+                    if resp.clicked() {
+                        self.state.active_server = Some(i);
+                        self.state.active_channel = Some(0);
+                        self.state.active_dm_peer = None;
+                        if let Some(topic) = self.state.current_topic() {
+                            self.state.load_messages_for_topic(&topic);
+                            self.state.mark_read(&topic);
+                        }
+                        let _ = self.cmd_tx.send(NetCommand::JoinServer(
+                            self.state.current_topic().unwrap_or_default()
+                        ));
+                    }
+                    resp.on_hover_text(&server.name);
+                }
+
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(4.0);
+
+                // Add server
+                if ui.add(egui::Button::new(RichText::new("+").size(18.0).color(TEXT_FAINT))
+                    .min_size(Vec2::new(36.0, 36.0)).rounding(10.0)
+                    .stroke(egui::Stroke::new(1.5, BORDER))
+                ).clicked() {
+                    self.modal = Modal::CreateServer;
+                    self.modal_input.clear();
+                }
+
+                // Connect
+                if ui.add(egui::Button::new(RichText::new("->").size(11.0).color(TEXT_FAINT))
+                    .rounding(4.0)
+                ).on_hover_text("Connect to Peer").clicked() {
+                    self.modal = Modal::ConnectPeer;
+                    self.modal_input.clear();
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Settings
+                    if ui.add(egui::Button::new(RichText::new("*").size(14.0).color(TEXT_FAINT))
+                        .frame(false)
+                    ).clicked() {
+                        self.state.audio.available_inputs = crate::media::list_input_devices();
+                        self.state.audio.available_outputs = crate::media::list_output_devices();
+                        self.modal = Modal::Settings;
+                    }
+
+                    // Identity
+                    ui.label(RichText::new(&self.state.profile.display_name).size(12.0).color(TEXT_DIM));
+                    ui.label(RichText::new(initials(&self.state.profile.display_name)).size(11.0).color(TEXT_DIM));
+
+                    // Green dot
+                    let (rect, _) = ui.allocate_exact_size(Vec2::new(6.0, 6.0), egui::Sense::hover());
+                    ui.painter().circle_filled(rect.center(), 3.0, GREEN);
+                });
+            });
+        });
+
+        // ── Left sidebar ──
+        egui::SidePanel::left("sidebar").default_width(240.0).frame(
+            egui::Frame::new().fill(BG_BASE).inner_margin(0.0)
+        ).show(ctx, |ui| {
+            // Server name header
+            let server_name = self.state.active_server
+                .and_then(|i| self.state.servers.get(i))
+                .map(|s| s.name.clone())
+                .unwrap_or_default();
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.add_space(14.0);
+                ui.label(RichText::new(&server_name).size(14.0).strong().color(TEXT_BRIGHT));
+            });
+            ui.add_space(6.0);
+            ui.separator();
+
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                // Channels
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    ui.label(RichText::new("CHANNELS").size(10.0).color(TEXT_FAINT));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("+").clicked() {
+                            self.modal = Modal::CreateChannel;
+                            self.modal_input.clear();
+                        }
+                    });
+                });
+
+                if let Some(si) = self.state.active_server {
+                    if let Some(server) = self.state.servers.clone().get(si) {
+                        for (i, channel) in server.channels.iter().enumerate() {
+                            let active = self.state.active_channel == Some(i);
+                            let topic = server.topic_for_channel(&channel.id);
+                            let unread = self.state.unread.get(&topic).copied().unwrap_or(0);
+
+                            ui.horizontal(|ui| {
+                                ui.add_space(14.0);
+                                let text = RichText::new(format!("# {}", channel.name))
+                                    .size(13.0)
+                                    .color(if active { TEXT_BRIGHT } else { TEXT_MUTED });
+
+                                let btn = ui.add(egui::Button::new(text)
+                                    .fill(if active { Color32::from_rgb(20, 20, 20) } else { Color32::TRANSPARENT })
+                                    .frame(false)
+                                );
+                                if btn.clicked() {
+                                    self.state.active_channel = Some(i);
+                                    self.state.active_dm_peer = None;
+                                    if let Some(t) = self.state.current_topic() {
+                                        self.state.load_messages_for_topic(&t);
+                                        self.state.mark_read(&t);
+                                    }
+                                }
+
+                                if unread > 0 {
+                                    let (r, _) = ui.allocate_exact_size(Vec2::new(5.0, 5.0), egui::Sense::hover());
+                                    ui.painter().circle_filled(r.center(), 2.5, TEXT_BRIGHT);
+                                }
+                            });
+                        }
+                    }
+                }
+
+                // DMs
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    ui.label(RichText::new("DIRECT").size(10.0).color(TEXT_FAINT));
+                });
+
+                for (pid, profile) in self.state.peers.clone() {
+                    ui.horizontal(|ui| {
+                        ui.add_space(14.0);
+                        let (dot_rect, _) = ui.allocate_exact_size(Vec2::new(6.0, 6.0), egui::Sense::hover());
+                        ui.painter().circle_filled(dot_rect.center(), 3.0, status_color(profile.status));
+                        ui.add_space(4.0);
+                        if ui.add(egui::Button::new(
+                            RichText::new(&profile.display_name).size(12.0).color(TEXT_MUTED)
+                        ).frame(false)).clicked() {
+                            self.state.active_dm_peer = Some(pid.clone());
+                        }
+                    });
+                }
+            });
+
+            // User panel at bottom
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                ui.add_space(4.0);
+                egui::Frame::new().fill(Color32::from_rgb(10, 10, 10)).inner_margin(8.0).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let (dot_rect, _) = ui.allocate_exact_size(Vec2::new(6.0, 6.0), egui::Sense::hover());
+                        ui.painter().circle_filled(dot_rect.center(), 3.0, status_color(self.state.profile.status));
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(&self.state.profile.display_name).size(12.0).color(TEXT_NORMAL));
+                    });
+                });
+            });
+        });
+
+        // ── Right panel (members or search) ──
+        egui::SidePanel::right("right").default_width(200.0).frame(
+            egui::Frame::new().fill(BG_BASE).inner_margin(8.0)
+        ).show(ctx, |ui| {
+            if self.search_open {
+                ui.label(RichText::new("Search").size(13.0).color(TEXT_BRIGHT));
+                ui.add_space(4.0);
+                let resp = ui.text_edit_singleline(&mut self.search_query);
+                if resp.changed() && self.search_query.len() >= 2 {
+                    self.search_results = self.state.search_messages(&self.search_query);
+                }
+                ui.add_space(8.0);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for msg in &self.search_results.clone() {
+                        ui.group(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(&msg.sender_name).size(11.0).color(TEXT_NORMAL));
+                                ui.label(RichText::new(msg.timestamp.format("%H:%M").to_string()).size(9.0).color(TEXT_FAINT));
+                            });
+                            let preview = if msg.content.len() > 60 { format!("{}...", &msg.content[..60]) } else { msg.content.clone() };
+                            ui.label(RichText::new(preview).size(11.0).color(TEXT_DIM));
+                        });
+                    }
+                });
+            } else {
+                // Members
+                let online = self.state.peers.values().filter(|p| p.status != UserStatus::Offline).count() + 1;
+                ui.label(RichText::new(format!("ONLINE — {}", online)).size(10.0).color(TEXT_FAINT));
+                ui.add_space(4.0);
+
+                // Self
+                ui.horizontal(|ui| {
+                    let (dot_rect, _) = ui.allocate_exact_size(Vec2::new(6.0, 6.0), egui::Sense::hover());
+                    ui.painter().circle_filled(dot_rect.center(), 3.0, STATUS_ONLINE);
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(&self.state.profile.display_name).size(11.0).color(TEXT_NORMAL));
+                    ui.label(RichText::new("you").size(9.0).color(TEXT_FAINT));
+                });
+
+                for (_, profile) in &self.state.peers.clone() {
+                    if profile.status == UserStatus::Offline { continue; }
+                    ui.horizontal(|ui| {
+                        let (dot_rect, _) = ui.allocate_exact_size(Vec2::new(6.0, 6.0), egui::Sense::hover());
+                        ui.painter().circle_filled(dot_rect.center(), 3.0, status_color(profile.status));
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(&profile.display_name).size(11.0).color(TEXT_DIM));
+                    });
+                }
+            }
+        });
+
+        // ── Central panel (messages + input) ──
+        egui::CentralPanel::default().frame(
+            egui::Frame::new().fill(BG_MAIN).inner_margin(0.0)
+        ).show(ctx, |ui| {
+            // Header
+            let channel_name = self.state.active_server
+                .and_then(|si| self.state.servers.get(si))
+                .and_then(|s| self.state.active_channel.and_then(|ci| s.channels.get(ci)))
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| "general".into());
+
+            ui.horizontal(|ui| {
+                ui.add_space(20.0);
+                ui.label(RichText::new("#").size(14.0).color(TEXT_MUTED));
+                ui.label(RichText::new(&channel_name).size(14.0).strong().color(TEXT_BRIGHT));
+                ui.separator();
+                ui.label(RichText::new(format!("{} peers", self.state.peers.len() + 1)).size(11.0).color(TEXT_FAINT));
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Search button
+                    if ui.add(egui::Button::new(RichText::new("search").size(11.0).color(TEXT_FAINT)).frame(false)).clicked() {
+                        self.search_open = !self.search_open;
+                    }
+                    // P2P badge
+                    ui.horizontal(|ui| {
+                        let (dot_rect, _) = ui.allocate_exact_size(Vec2::new(5.0, 5.0), egui::Sense::hover());
+                        ui.painter().circle_filled(dot_rect.center(), 2.5, GREEN);
+                        ui.label(RichText::new("p2p").size(10.0).color(TEXT_FAINT));
+                    });
+                });
+            });
+            ui.separator();
+
+            // Messages
+            let messages = self.state.current_messages().into_iter().cloned().collect::<Vec<_>>();
+            let available = ui.available_height() - 50.0; // reserve for input
+
+            egui::ScrollArea::vertical().max_height(available).stick_to_bottom(true).show(ui, |ui| {
+                // Welcome
+                ui.add_space(24.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(24.0);
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("#_").size(20.0).color(TEXT_FAINT).monospace());
+                        ui.label(RichText::new(&channel_name).size(18.0).strong().color(TEXT_BRIGHT));
+                        ui.label(RichText::new("Beginning of this channel. End-to-end encrypted.").size(12.0).color(TEXT_FAINT));
+                    });
+                });
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
+
+                // Render messages
+                let mut last_sender: Option<String> = None;
+                for msg in &messages {
+                    let is_cont = last_sender.as_ref() == Some(&msg.sender_peer_id);
+
+                    if !is_cont {
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(24.0);
+                            // Avatar
+                            let (av_rect, _) = ui.allocate_exact_size(Vec2::new(34.0, 34.0), egui::Sense::hover());
+                            ui.painter().rect_filled(av_rect, 8.0, avatar_color(&msg.sender_name));
+                            ui.painter().text(
+                                av_rect.center(), egui::Align2::CENTER_CENTER,
+                                initials(&msg.sender_name),
+                                egui::FontId::proportional(12.0), TEXT_DIM,
+                            );
+                            ui.add_space(10.0);
+                            ui.vertical(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(&msg.sender_name).size(12.0).strong().color(TEXT_NORMAL));
+                                    ui.label(RichText::new(msg.timestamp.format("%H:%M").to_string()).size(9.0).color(TEXT_FAINT));
+                                    ui.label(RichText::new("e2e").size(8.0).color(Color32::from_rgb(30, 30, 30)));
+                                    if msg.edited {
+                                        ui.label(RichText::new("(edited)").size(9.0).color(TEXT_FAINT));
+                                    }
+                                });
+                                // Rich text with basic markdown
+                                render_message_text(ui, &msg.content);
+
+                                // Reactions
+                                if !msg.reactions.is_empty() {
+                                    ui.horizontal(|ui| {
+                                        for (emoji, peers) in &msg.reactions {
+                                            if ui.small_button(format!("{} {}", emoji, peers.len())).clicked() {
+                                                // Toggle reaction
+                                            }
+                                        }
+                                    });
+                                }
+                            });
+                        });
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.add_space(68.0); // align with text above
+                            render_message_text(ui, &msg.content);
+                        });
+                    }
+                    last_sender = Some(msg.sender_peer_id.clone());
+                }
+            });
+
+            // Typing indicator
+            if !self.typing_names.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.add_space(24.0);
+                    let dots = ".".repeat(((self.anim_tick / 30) % 4) as usize);
+                    let who = if self.typing_names.len() == 1 {
+                        format!("{} is typing{}", self.typing_names[0], dots)
+                    } else {
+                        format!("several people are typing{}", dots)
+                    };
+                    ui.label(RichText::new(who).size(10.0).color(TEXT_FAINT));
+                });
+            }
+
+            // Reply banner
+            if let Some(ref reply_id) = self.reply_to_id.clone() {
+                ui.horizontal(|ui| {
+                    ui.add_space(20.0);
+                    let preview = self.state.find_message(reply_id)
+                        .map(|m| format!("Replying to {}", m.sender_name))
+                        .unwrap_or_else(|| "Replying...".into());
+                    ui.label(RichText::new(preview).size(11.0).color(TEXT_DIM));
+                    if ui.small_button("x").clicked() {
+                        self.reply_to_id = None;
+                    }
+                });
+            }
+
+            // Input
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.add_space(20.0);
+                egui::Frame::new().fill(BG_ELEVATED).rounding(8.0).inner_margin(8.0).show(ui, |ui| {
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.state.input_buffer)
+                            .desired_width(ui.available_width())
+                            .hint_text(format!("message #{} — encrypted", channel_name))
+                            .frame(false)
+                    );
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        self.send_message();
+                        resp.request_focus();
+                    }
+                });
+                ui.add_space(20.0);
+            });
+            ui.add_space(16.0);
+        });
+
+        // ── Modal ──
+        if self.modal != Modal::None {
+            self.show_modal(ctx);
+        }
+
+        // Request repaint for animations
+        ctx.request_repaint();
+    }
+}
+
+impl MurmurApp {
+    fn show_modal(&mut self, ctx: &egui::Context) {
+        let (title, placeholder) = match self.modal {
+            Modal::CreateServer => ("Create Server", "Server name..."),
+            Modal::JoinServer => ("Join Server", "Server name or invite code..."),
+            Modal::CreateChannel => ("Create Channel", "channel-name"),
+            Modal::ChangeDisplayName => ("Change Name", "Display name..."),
+            Modal::ConnectPeer => ("Connect to Peer", "/ip4/.../tcp/.../p2p/12D3K..."),
+            Modal::Settings => ("Settings", ""),
+            Modal::None => return,
+        };
+
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .fixed_size([400.0, if self.modal == Modal::Settings { 500.0 } else { 180.0 }])
+            .show(ctx, |ui| {
+                if self.modal == Modal::Settings {
+                    self.show_settings(ui);
+                    return;
+                }
+
+                ui.add_space(8.0);
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.modal_input)
+                        .hint_text(placeholder)
+                        .desired_width(f32::INFINITY)
+                );
+
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    self.confirm_modal();
+                }
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        self.modal = Modal::None;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button(match self.modal {
+                            Modal::CreateServer => "Create",
+                            Modal::JoinServer => "Join",
+                            Modal::ConnectPeer => "Connect",
+                            _ => "Save",
+                        }).clicked() {
+                            self.confirm_modal();
+                        }
+                    });
+                });
+            });
+    }
+
+    fn confirm_modal(&mut self) {
+        let input = self.modal_input.trim().to_string();
+        if input.is_empty() { self.modal = Modal::None; return; }
+
+        match self.modal {
+            Modal::CreateServer => {
+                let server = Server::new_owned(input, self.state.profile.peer_id.clone());
+                let topic = server.topic_for_channel("general");
+                self.state.add_server(server);
+                let _ = self.cmd_tx.send(NetCommand::JoinServer(topic));
+            }
+            Modal::JoinServer => {
+                if let Some((name, addrs)) = Server::parse_invite(&input) {
+                    let mut server = Server::new(name);
+                    for addr_str in &addrs {
+                        if let Ok(addr) = addr_str.parse() {
+                            let _ = self.cmd_tx.send(NetCommand::Dial(addr));
+                        }
+                        server.add_peer("unknown", vec![addr_str.clone()]);
+                    }
+                    let topic = server.topic_for_channel("general");
+                    self.state.add_server(server);
+                    let _ = self.cmd_tx.send(NetCommand::JoinServer(topic));
+                } else {
+                    let server = Server::new(input);
+                    let topic = server.topic_for_channel("general");
+                    self.state.add_server(server);
+                    let _ = self.cmd_tx.send(NetCommand::JoinServer(topic));
+                }
+            }
+            Modal::CreateChannel => {
+                if let Some(si) = self.state.active_server {
+                    if let Some(server) = self.state.servers.get(si) {
+                        let channel = Channel { id: input.to_lowercase().replace(' ', "-"), name: input.clone() };
+                        let server_id = server.id.clone();
+                        self.state.add_channel_to_server(&server_id, channel.clone());
+                        let _ = self.cmd_tx.send(NetCommand::CreateChannel { server_id, channel });
+                    }
+                }
+            }
+            Modal::ChangeDisplayName => {
+                self.state.set_display_name(input);
+                let _ = self.cmd_tx.send(NetCommand::UpdatePresence(self.state.profile.status));
+            }
+            Modal::ConnectPeer => {
+                if let Ok(addr) = input.parse() {
+                    let _ = self.cmd_tx.send(NetCommand::Dial(addr));
+                }
+            }
+            _ => {}
+        }
+        self.modal = Modal::None;
+    }
+
+    fn show_settings(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            // Addresses
+            ui.label(RichText::new("YOUR ADDRESSES").size(10.0).color(TEXT_FAINT));
+            for addr in &self.state.listen_addrs.clone() {
+                if ui.add(egui::Button::new(RichText::new(addr).size(10.0).color(TEXT_DIM)).frame(false)).clicked() {
+                    ui.output_mut(|o| o.copied_text = addr.clone());
+                }
+            }
+            ui.separator();
+
+            // Volume
+            ui.horizontal(|ui| {
+                ui.label("Input Volume");
+                ui.add(egui::Slider::new(&mut self.state.audio.input_volume, 0.0..=2.0).text(""));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Output Volume");
+                ui.add(egui::Slider::new(&mut self.state.audio.output_volume, 0.0..=2.0).text(""));
+            });
+            ui.separator();
+
+            // Noise suppression
+            ui.checkbox(&mut self.state.audio.noise_suppression, "Noise Suppression (RNNoise)");
+            ui.separator();
+
+            // Mic test
+            ui.horizontal(|ui| {
+                ui.label("Mic Test");
+                if self.state.audio.mic_testing {
+                    if ui.button("Stop").clicked() {
+                        if let Some(mut t) = self.mic_tester.take() { t.stop(); }
+                        self.state.audio.mic_testing = false;
+                        self.state.audio.mic_level = 0.0;
+                    }
+                } else {
+                    if ui.button("Start").clicked() {
+                        if let Ok(t) = crate::media::MicTester::start(&self.state.audio.input_device, self.state.audio.input_volume) {
+                            self.mic_tester = Some(t);
+                            self.state.audio.mic_testing = true;
+                        }
+                    }
+                }
+            });
+            let level = self.state.audio.mic_level;
+            let bar_color = if level > 0.7 { RED } else if level > 0.4 { YELLOW } else { GREEN };
+            ui.add(egui::ProgressBar::new(level).fill(bar_color));
+
+            ui.add_space(12.0);
+            if ui.button("Close").clicked() {
+                self.state.save_audio_settings();
+                self.modal = Modal::None;
+            }
+        });
+    }
+}
+
+/// Render message text with basic inline markdown.
+fn render_message_text(ui: &mut egui::Ui, text: &str) {
+    // Simple inline markdown: **bold**, *italic*, `code`
+    // For now, parse basic patterns
+    let mut job = egui::text::LayoutJob::default();
+
+    let mut i = 0;
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+
+    while i < len {
+        if i + 1 < len && bytes[i] == b'*' && bytes[i + 1] == b'*' {
+            // Bold
+            let start = i + 2;
+            if let Some(end) = text[start..].find("**") {
+                job.append(&text[start..start + end], 0.0,
+                    egui::TextFormat { color: TEXT_BRIGHT, font_id: egui::FontId::proportional(13.0), ..Default::default() });
+                i = start + end + 2;
+                continue;
+            }
+        }
+        if bytes[i] == b'`' {
+            // Code
+            let start = i + 1;
+            if let Some(end) = text[start..].find('`') {
+                job.append(&text[start..start + end], 0.0,
+                    egui::TextFormat {
+                        color: TEXT_NORMAL,
+                        font_id: egui::FontId::monospace(12.0),
+                        background: Color32::from_rgb(26, 26, 26),
+                        ..Default::default()
+                    });
+                i = start + end + 1;
+                continue;
+            }
+        }
+        if bytes[i] == b'*' && (i == 0 || bytes[i - 1] != b'*') {
+            // Italic
+            let start = i + 1;
+            if let Some(end) = text[start..].find('*') {
+                if start + end < len && (start + end + 1 >= len || bytes[start + end + 1] != b'*') {
+                    job.append(&text[start..start + end], 0.0,
+                        egui::TextFormat { color: TEXT_DIM, italics: true, font_id: egui::FontId::proportional(13.0), ..Default::default() });
+                    i = start + end + 1;
+                    continue;
+                }
+            }
+        }
+
+        // Regular text — accumulate until next special char
+        let start = i;
+        while i < len && bytes[i] != b'*' && bytes[i] != b'`' {
+            i += 1;
+        }
+        if i > start {
+            job.append(&text[start..i], 0.0,
+                egui::TextFormat { color: TEXT_DIM, font_id: egui::FontId::proportional(13.0), ..Default::default() });
+        }
+    }
+
+    ui.label(job);
 }
